@@ -18,6 +18,8 @@ MODULE_CACHE="$BUILD_DIR/ModuleCache"
     -mmacosx-version-min=14.0 \
     -framework AppKit \
     -framework Foundation \
+    -framework Security \
+    -framework LocalAuthentication \
     -framework ServiceManagement \
     "$SOURCE_DIR/TBUsageModels.m" \
     "$SOURCE_DIR/TBUsageServices.m" \
@@ -30,6 +32,8 @@ fi
 
 /bin/mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 /bin/cp "$BUILD_DIR/$APP_NAME" "$APP_DIR/Contents/MacOS/$APP_NAME"
+/bin/cp "$PROJECT_DIR"/Resources/ProviderIcon-*.svg "$APP_DIR/Contents/Resources/"
+/bin/cp "$PROJECT_DIR/Resources/ProviderIcons-LICENSE.txt" "$APP_DIR/Contents/Resources/"
 /bin/cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 /usr/bin/codesign --force --deep --sign - "$APP_DIR"
 

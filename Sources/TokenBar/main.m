@@ -49,18 +49,63 @@ static NSBox *TBSeparator(void) {
 
 @end
 
-@interface TBFlippedView : NSView
-@end
+static const CGFloat TBPanelWidth = 344;
 
-@implementation TBFlippedView
-- (BOOL)isFlipped {
-    return YES;
+static NSColor *TBProviderColor(BOOL claude) {
+    return claude ? [NSColor colorWithSRGBRed:0.83 green:0.48 blue:0.35 alpha:1]
+                  : [NSColor colorWithSRGBRed:0.37 green:0.59 blue:0.88 alpha:1];
 }
-@end
+
+static NSString *TBPercent(double percent) {
+    double value = MIN(MAX(percent, 0), 100);
+    if (value > 0 && value < 0.1) return @"<0.1%";
+    return fabs(value - round(value)) < 0.05
+        ? [NSString stringWithFormat:@"%.0f%%", value]
+        : [NSString stringWithFormat:@"%.1f%%", value];
+}
+
+static NSString *TBDuration(NSTimeInterval seconds) {
+    NSInteger minutes = MAX(1, (NSInteger)ceil(seconds / 60));
+    if (minutes >= 24 * 60) return [NSString stringWithFormat:@"%ldd %ldh", (long)(minutes / 1440), (long)(minutes % 1440 / 60)];
+    if (minutes >= 60) return [NSString stringWithFormat:@"%ldh %ldm", (long)(minutes / 60), (long)(minutes % 60)];
+    return [NSString stringWithFormat:@"%ldm", (long)minutes];
+}
+
+static NSString *TBCaptureAge(NSDate *date) {
+    NSTimeInterval age = MAX(0, -date.timeIntervalSinceNow);
+    if (age < 60) return @"Just now";
+    return [TBDuration(floor(age / 60) * 60) stringByAppendingString:@" ago"];
+}
+
+static NSStackView *TBStack(NSArray<NSView *> *views, BOOL vertical, CGFloat spacing) {
+    NSStackView *stack = [NSStackView stackViewWithViews:views];
+    stack.orientation = vertical ? NSUserInterfaceLayoutOrientationVertical : NSUserInterfaceLayoutOrientationHorizontal;
+    stack.alignment = vertical ? NSLayoutAttributeLeading : NSLayoutAttributeCenterY;
+    stack.spacing = spacing;
+    return stack;
+}
+
+static NSView *TBSpacer(void) {
+    NSView *spacer = [NSView new];
+    [spacer setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    return spacer;
+}
+
+static NSButton *TBSymbolButton(NSString *symbol, NSString *label, id target, SEL action) {
+    NSButton *button = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:label]
+                                       target:target action:action];
+    button.bordered = NO;
+    button.contentTintColor = NSColor.secondaryLabelColor;
+    button.toolTip = label;
+    [button.widthAnchor constraintEqualToConstant:24].active = YES;
+    [button.heightAnchor constraintEqualToConstant:24].active = YES;
+    return button;
+}
 
 @interface TBTokenBarViewController : NSViewController
 @property(nonatomic, copy) dispatch_block_t onRefresh;
 @property(nonatomic, copy) dispatch_block_t onConnectClaude;
+@property(nonatomic, copy) dispatch_block_t onAuthorizeClaude;
 @property(nonatomic, nullable) TBProviderSnapshot *codexSnapshot;
 @property(nonatomic, nullable) TBProviderSnapshot *claudeSnapshot;
 @property(nonatomic, nullable, copy) NSString *codexError;
@@ -68,176 +113,77 @@ static NSBox *TBSeparator(void) {
 @property(nonatomic) BOOL codexLoading;
 @property(nonatomic) BOOL claudeLoading;
 @property(nonatomic) BOOL claudeNeedsConnection;
+@property(nonatomic) BOOL claudeNeedsAuthorization;
 @property(nonatomic) BOOL connectingClaude;
+@property(nonatomic) BOOL modelLimitsExpanded;
 @property(nonatomic, nullable) NSDate *lastUpdated;
-@property(nonatomic) NSTextField *updatedLabel;
+@property(nonatomic, nullable) NSDate *nextAutomaticRefreshAt;
 @property(nonatomic) NSButton *refreshButton;
 @property(nonatomic) NSStackView *contentStack;
-@property(nonatomic) NSSwitch *loginSwitch;
+@property(nonatomic) NSStackView *outerStack;
 @property(nonatomic) NSTextField *settingsMessageLabel;
+@property(nonatomic) NSTextField *scheduleLabel;
 - (void)render;
 @end
 
 @implementation TBTokenBarViewController
 
 - (void)loadView {
-    NSVisualEffectView *root = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, 382, 580)];
+    NSVisualEffectView *root = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, TBPanelWidth, 360)];
     root.material = NSVisualEffectMaterialPopover;
     root.blendingMode = NSVisualEffectBlendingModeBehindWindow;
     root.state = NSVisualEffectStateActive;
     self.view = root;
 
-    NSStackView *outer = [NSStackView new];
-    outer.orientation = NSUserInterfaceLayoutOrientationVertical;
-    outer.alignment = NSLayoutAttributeLeading;
-    outer.spacing = 0;
-    outer.translatesAutoresizingMaskIntoConstraints = NO;
-    [root addSubview:outer];
+    self.contentStack = TBStack(@[], YES, 16);
+    self.contentStack.edgeInsets = NSEdgeInsetsMake(4, 0, 4, 0);
+    self.settingsMessageLabel = TBLabel(@"", 11, NSFontWeightRegular);
+    self.settingsMessageLabel.textColor = NSColor.secondaryLabelColor;
+    self.settingsMessageLabel.maximumNumberOfLines = 3;
+    self.settingsMessageLabel.lineBreakMode = NSLineBreakByWordWrapping;
+    self.settingsMessageLabel.hidden = YES;
+
+    self.outerStack = TBStack(@[[self headerView], self.contentStack, self.settingsMessageLabel,
+                                TBSeparator(), [self footerView]], YES, 12);
+    self.outerStack.translatesAutoresizingMaskIntoConstraints = NO;
+    self.outerStack.edgeInsets = NSEdgeInsetsMake(14, 16, 12, 16);
+    [root addSubview:self.outerStack];
     [NSLayoutConstraint activateConstraints:@[
-        [outer.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
-        [outer.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
-        [outer.topAnchor constraintEqualToAnchor:root.topAnchor],
-        [outer.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
+        [self.outerStack.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
+        [self.outerStack.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
+        [self.outerStack.topAnchor constraintEqualToAnchor:root.topAnchor],
+        [self.outerStack.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
     ]];
-
-    NSView *header = [self headerView];
-    [outer addArrangedSubview:header];
-    [header.widthAnchor constraintEqualToAnchor:outer.widthAnchor].active = YES;
-    [outer addArrangedSubview:TBSeparator()];
-
-    NSScrollView *scroll = [NSScrollView new];
-    scroll.drawsBackground = NO;
-    scroll.hasVerticalScroller = YES;
-    scroll.autohidesScrollers = YES;
-    self.contentStack = [NSStackView new];
-    self.contentStack.orientation = NSUserInterfaceLayoutOrientationVertical;
-    self.contentStack.alignment = NSLayoutAttributeLeading;
-    self.contentStack.spacing = 20;
-    self.contentStack.edgeInsets = NSEdgeInsetsMake(18, 18, 18, 18);
-    self.contentStack.translatesAutoresizingMaskIntoConstraints = NO;
-
-    NSView *document = [TBFlippedView new];
-    document.translatesAutoresizingMaskIntoConstraints = NO;
-    [document addSubview:self.contentStack];
-    scroll.documentView = document;
-    [NSLayoutConstraint activateConstraints:@[
-        [self.contentStack.leadingAnchor constraintEqualToAnchor:document.leadingAnchor],
-        [self.contentStack.trailingAnchor constraintEqualToAnchor:document.trailingAnchor],
-        [self.contentStack.topAnchor constraintEqualToAnchor:document.topAnchor],
-        [self.contentStack.bottomAnchor constraintEqualToAnchor:document.bottomAnchor],
-        [document.widthAnchor constraintEqualToAnchor:scroll.contentView.widthAnchor],
-    ]];
-    [outer addArrangedSubview:scroll];
-    [scroll.widthAnchor constraintEqualToAnchor:outer.widthAnchor].active = YES;
-    [scroll setContentHuggingPriority:NSLayoutPriorityDefaultLow
-                      forOrientation:NSLayoutConstraintOrientationVertical];
-
-    [outer addArrangedSubview:TBSeparator()];
-    NSView *footer = [self footerView];
-    [outer addArrangedSubview:footer];
-    [footer.widthAnchor constraintEqualToAnchor:outer.widthAnchor].active = YES;
-
-    self.codexLoading = YES;
-    self.claudeLoading = YES;
+    for (NSView *child in self.outerStack.arrangedSubviews) {
+        [child.widthAnchor constraintEqualToAnchor:self.outerStack.widthAnchor constant:-32].active = YES;
+    }
     [self render];
 }
 
 - (NSView *)headerView {
-    NSView *header = [NSView new];
-    header.translatesAutoresizingMaskIntoConstraints = NO;
-    [header.heightAnchor constraintEqualToConstant:66].active = YES;
-
-    NSTextField *title = TBLabel(@"TokenBar", 18, NSFontWeightSemibold);
-    title.font = [NSFont systemFontOfSize:18 weight:NSFontWeightSemibold];
-    self.updatedLabel = TBLabel(@"Reading account usage…", 11, NSFontWeightRegular);
-    self.updatedLabel.textColor = NSColor.secondaryLabelColor;
-
-    NSStackView *labels = [NSStackView stackViewWithViews:@[title, self.updatedLabel]];
-    labels.orientation = NSUserInterfaceLayoutOrientationVertical;
-    labels.alignment = NSLayoutAttributeLeading;
-    labels.spacing = 3;
-    labels.translatesAutoresizingMaskIntoConstraints = NO;
-    [header addSubview:labels];
-
-    self.refreshButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"arrow.clockwise"
-                                                                        accessibilityDescription:@"Refresh usage"]
-                                       target:self
-                                       action:@selector(refreshPressed:)];
-    self.refreshButton.bordered = NO;
-    self.refreshButton.toolTip = @"Refresh usage";
-    self.refreshButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [header addSubview:self.refreshButton];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [labels.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:18],
-        [labels.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
-        [self.refreshButton.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16],
-        [self.refreshButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
-        [self.refreshButton.widthAnchor constraintEqualToConstant:28],
-        [self.refreshButton.heightAnchor constraintEqualToConstant:28],
-    ]];
-    return header;
+    NSTextField *title = TBLabel(@"TokenBar", 13, NSFontWeightSemibold);
+    self.refreshButton = TBSymbolButton(@"arrow.clockwise", @"Refresh usage", self, @selector(refreshPressed:));
+    NSButton *settings = TBSymbolButton(@"gearshape", @"TokenBar settings", self, @selector(settingsPressed:));
+    return TBStack(@[title, TBSpacer(), self.refreshButton, settings], NO, 6);
 }
 
 - (NSView *)footerView {
-    NSView *footer = [NSView new];
-    footer.translatesAutoresizingMaskIntoConstraints = NO;
-
-    NSTextField *loginLabel = TBLabel(@"Launch at login", 12, NSFontWeightRegular);
-    self.loginSwitch = [NSSwitch new];
-    self.loginSwitch.controlSize = NSControlSizeSmall;
-    self.loginSwitch.target = self;
-    self.loginSwitch.action = @selector(loginSwitchChanged:);
-    self.loginSwitch.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled
-        ? NSControlStateValueOn : NSControlStateValueOff;
-
-    NSStackView *loginRow = [NSStackView stackViewWithViews:@[loginLabel, self.loginSwitch]];
-    loginRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    loginRow.distribution = NSStackViewDistributionFill;
-    loginRow.translatesAutoresizingMaskIntoConstraints = NO;
-
-    self.settingsMessageLabel = TBLabel(@"", 10, NSFontWeightRegular);
-    self.settingsMessageLabel.textColor = NSColor.secondaryLabelColor;
-    self.settingsMessageLabel.maximumNumberOfLines = 2;
-    self.settingsMessageLabel.lineBreakMode = NSLineBreakByWordWrapping;
-    self.settingsMessageLabel.hidden = YES;
-
-    NSButton *usageButton = [NSButton buttonWithTitle:@"Claude usage page"
-                                               target:self
-                                               action:@selector(openClaudeUsage:)];
-    usageButton.bezelStyle = NSBezelStyleInline;
-    usageButton.bordered = NO;
-    usageButton.contentTintColor = NSColor.secondaryLabelColor;
-
-    NSButton *quitButton = [NSButton buttonWithTitle:@"Quit TokenBar"
-                                              target:self
-                                              action:@selector(quitPressed:)];
-    quitButton.bezelStyle = NSBezelStyleInline;
-    quitButton.bordered = NO;
-    quitButton.contentTintColor = NSColor.secondaryLabelColor;
-
-    NSStackView *buttonRow = [NSStackView stackViewWithViews:@[usageButton, quitButton]];
-    buttonRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    buttonRow.distribution = NSStackViewDistributionEqualSpacing;
-
-    NSStackView *stack = [NSStackView stackViewWithViews:@[
-        loginRow, self.settingsMessageLabel, buttonRow,
-    ]];
-    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
-    stack.alignment = NSLayoutAttributeLeading;
-    stack.spacing = 8;
-    stack.translatesAutoresizingMaskIntoConstraints = NO;
-    [footer addSubview:stack];
-    [NSLayoutConstraint activateConstraints:@[
-        [stack.leadingAnchor constraintEqualToAnchor:footer.leadingAnchor constant:18],
-        [stack.trailingAnchor constraintEqualToAnchor:footer.trailingAnchor constant:-18],
-        [stack.topAnchor constraintEqualToAnchor:footer.topAnchor constant:11],
-        [stack.bottomAnchor constraintEqualToAnchor:footer.bottomAnchor constant:-11],
-        [loginRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
-        [self.settingsMessageLabel.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
-        [buttonRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
-    ]];
-    return footer;
+    NSImageView *clock = [NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"clock"
+                                                                    accessibilityDescription:@"Refresh schedule"]];
+    clock.contentTintColor = NSColor.tertiaryLabelColor;
+    [clock.widthAnchor constraintEqualToConstant:11].active = YES;
+    [clock.heightAnchor constraintEqualToConstant:11].active = YES;
+    self.scheduleLabel = TBLabel(@"Checking usage…", 10, NSFontWeightRegular);
+    self.scheduleLabel.textColor = NSColor.secondaryLabelColor;
+    NSButton *usage = [NSButton buttonWithTitle:@"Usage" target:self action:@selector(openClaudeUsage:)];
+    usage.bordered = NO;
+    usage.font = [NSFont systemFontOfSize:10];
+    usage.contentTintColor = NSColor.secondaryLabelColor;
+    usage.image = [NSImage imageWithSystemSymbolName:@"arrow.up.right" accessibilityDescription:nil];
+    usage.imagePosition = NSImageRight;
+    usage.imageScaling = NSImageScaleProportionallyDown;
+    usage.toolTip = @"Open Claude’s usage dashboard";
+    return TBStack(@[clock, self.scheduleLabel, TBSpacer(), usage], NO, 5);
 }
 
 - (void)render {
@@ -246,233 +192,206 @@ static NSBox *TBSeparator(void) {
         [self.contentStack removeArrangedSubview:view];
         [view removeFromSuperview];
     }
-
-    NSView *codex = [self providerViewWithTitle:@"Codex"
-                                       subtitle:@"Weekly allowance"
-                                       snapshot:self.codexSnapshot
-                                         error:self.codexError
-                                       loading:self.codexLoading
-                               needsConnection:NO];
-    [self.contentStack addArrangedSubview:codex];
-    [codex.widthAnchor constraintEqualToAnchor:self.contentStack.widthAnchor constant:-36].active = YES;
-    [self.contentStack addArrangedSubview:TBSeparator()];
-
-    NSView *claude = [self providerViewWithTitle:@"Claude"
-                                        subtitle:@"Session and weekly allowances"
-                                        snapshot:self.claudeSnapshot
-                                          error:self.claudeError
-                                        loading:self.claudeLoading
-                                needsConnection:self.claudeNeedsConnection];
-    [self.contentStack addArrangedSubview:claude];
-    [claude.widthAnchor constraintEqualToAnchor:self.contentStack.widthAnchor constant:-36].active = YES;
-
-    if (self.lastUpdated != nil) {
-        NSDateFormatter *formatter = [NSDateFormatter new];
-        formatter.timeStyle = NSDateFormatterShortStyle;
-        formatter.dateStyle = NSDateFormatterNoStyle;
-        self.updatedLabel.stringValue = [NSString stringWithFormat:@"Updated %@",
-                                         [formatter stringFromDate:self.lastUpdated]];
+    NSArray *sections = @[
+        [self providerViewWithTitle:@"Codex" snapshot:self.codexSnapshot error:self.codexError loading:self.codexLoading],
+        TBSeparator(),
+        [self providerViewWithTitle:@"Claude" snapshot:self.claudeSnapshot error:self.claudeError loading:self.claudeLoading],
+    ];
+    for (NSView *view in sections) {
+        [self.contentStack addArrangedSubview:view];
+        [view.widthAnchor constraintEqualToAnchor:self.contentStack.widthAnchor].active = YES;
     }
-    self.refreshButton.enabled = !(self.codexLoading || self.claudeLoading);
+    BOOL loading = self.codexLoading || self.claudeLoading;
+    self.refreshButton.enabled = !loading && !self.connectingClaude;
+    NSDate *next = self.nextAutomaticRefreshAt ?: self.claudeSnapshot.nextRefreshAt;
+    self.scheduleLabel.stringValue = loading ? @"Checking usage…" :
+        next && next.timeIntervalSinceNow > 0
+            ? [@"Next check in " stringByAppendingString:TBDuration(next.timeIntervalSinceNow)]
+            : @"Automatic refresh";
+    self.scheduleLabel.toolTip = @"Claude checks are spaced at least 5 minutes apart. Checks slow down while idle and respect provider cooldowns.";
+    [self.view layoutSubtreeIfNeeded];
+    CGFloat height = MAX(220, ceil(self.outerStack.fittingSize.height));
+    self.preferredContentSize = NSMakeSize(TBPanelWidth, height);
+    [self.view setFrameSize:self.preferredContentSize];
+    if ([self.view.window.title isEqualToString:@"TokenBar Preview"]) {
+        [self.view.window setContentSize:self.preferredContentSize];
+    }
 }
 
-- (NSView *)providerViewWithTitle:(NSString *)title
-                         subtitle:(NSString *)subtitle
-                         snapshot:(TBProviderSnapshot *)snapshot
-                            error:(NSString *)error
-                          loading:(BOOL)loading
-                  needsConnection:(BOOL)needsConnection {
-    NSStackView *section = [NSStackView new];
-    section.orientation = NSUserInterfaceLayoutOrientationVertical;
-    section.alignment = NSLayoutAttributeLeading;
-    section.spacing = 13;
-
-    NSTextField *mark = TBLabel([title isEqualToString:@"Codex"] ? @"C" : @"A",
-                                10, NSFontWeightBold);
-    mark.textColor = NSColor.whiteColor;
-    mark.alignment = NSTextAlignmentCenter;
-    mark.wantsLayer = YES;
-    mark.layer.backgroundColor = [NSColor colorWithSRGBRed:0.15 green:0.18 blue:0.17 alpha:1].CGColor;
-    mark.layer.cornerRadius = 6;
-    [mark.widthAnchor constraintEqualToConstant:21].active = YES;
-    [mark.heightAnchor constraintEqualToConstant:21].active = YES;
-
-    NSTextField *heading = TBLabel(title, 15, NSFontWeightSemibold);
-    NSStackView *headingRow = [NSStackView stackViewWithViews:@[mark, heading]];
-    headingRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    headingRow.alignment = NSLayoutAttributeCenterY;
-    headingRow.spacing = 7;
-
-    NSTextField *subtitleLabel = TBLabel(subtitle, 11, NSFontWeightRegular);
-    subtitleLabel.textColor = NSColor.secondaryLabelColor;
-    NSStackView *headingGroup = [NSStackView stackViewWithViews:@[headingRow, subtitleLabel]];
-    headingGroup.orientation = NSUserInterfaceLayoutOrientationVertical;
-    headingGroup.alignment = NSLayoutAttributeLeading;
-    headingGroup.spacing = 3;
-
-    NSView *headingSpacer = [NSView new];
-    [headingSpacer setContentHuggingPriority:NSLayoutPriorityDefaultLow
-                              forOrientation:NSLayoutConstraintOrientationHorizontal];
-    NSMutableArray<NSView *> *topViews = [NSMutableArray arrayWithObjects:headingGroup, headingSpacer, nil];
+- (NSView *)providerViewWithTitle:(NSString *)title snapshot:(TBProviderSnapshot *)snapshot
+                            error:(NSString *)error loading:(BOOL)loading {
+    BOOL claude = [title isEqualToString:@"Claude"];
+    NSColor *accent = TBProviderColor(claude);
+    NSString *iconName = claude ? @"ProviderIcon-claude" : @"ProviderIcon-codex";
+    NSImage *image = [[NSImage alloc] initWithContentsOfFile:[NSBundle.mainBundle pathForResource:iconName ofType:@"svg"]];
+    image.template = YES;
+    NSImageView *icon = [NSImageView imageViewWithImage:image];
+    icon.contentTintColor = claude ? accent : NSColor.labelColor;
+    [icon.widthAnchor constraintEqualToConstant:24].active = YES;
+    [icon.heightAnchor constraintEqualToConstant:24].active = YES;
+    NSTextField *name = TBLabel(title, 13, NSFontWeightSemibold);
+    NSMutableArray *headingViews = [NSMutableArray arrayWithObjects:icon, name, nil];
     if (snapshot.plan.length > 0) {
         NSTextField *plan = TBLabel(snapshot.plan, 10, NSFontWeightMedium);
         plan.textColor = NSColor.secondaryLabelColor;
-        [topViews addObject:plan];
+        [headingViews addObject:plan];
     }
-    NSStackView *top = [NSStackView stackViewWithViews:topViews];
-    top.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    top.distribution = NSStackViewDistributionFill;
-    [section addArrangedSubview:top];
-    [top.widthAnchor constraintEqualToAnchor:section.widthAnchor].active = YES;
+    [headingViews addObject:TBSpacer()];
+    NSTextField *freshness = TBLabel(snapshot ? TBCaptureAge(snapshot.fetchedAt) : loading ? @"Checking…" : @"Unavailable",
+                                     10, NSFontWeightRegular);
+    freshness.textColor = NSColor.secondaryLabelColor;
+    if (snapshot) {
+        BOOL cached = error.length > 0 || -snapshot.fetchedAt.timeIntervalSinceNow >= 6 * 60;
+        if (cached) freshness.stringValue = [@"Cached " stringByAppendingString:TBCaptureAge(snapshot.fetchedAt)];
+        freshness.toolTip = [NSString stringWithFormat:@"Last measured %@%@", [NSDateFormatter localizedStringFromDate:snapshot.fetchedAt dateStyle:NSDateFormatterMediumStyle timeStyle:NSDateFormatterMediumStyle],
+            error.length ? [@". " stringByAppendingString:error] : @""];
+    }
+    [headingViews addObject:freshness];
+    NSStackView *heading = TBStack(headingViews, NO, 7);
+    NSStackView *section = TBStack(@[heading], YES, 12);
+    [heading.widthAnchor constraintEqualToAnchor:section.widthAnchor].active = YES;
 
-    if (loading) {
-        NSTextField *loadingLabel = TBLabel(@"Reading account usage…", 12, NSFontWeightRegular);
-        loadingLabel.textColor = NSColor.secondaryLabelColor;
-        NSProgressIndicator *indicator = [NSProgressIndicator new];
-        indicator.style = NSProgressIndicatorStyleBar;
-        indicator.indeterminate = YES;
-        [indicator startAnimation:nil];
-        [section addArrangedSubview:loadingLabel];
-        [section addArrangedSubview:indicator];
-        [indicator.widthAnchor constraintEqualToAnchor:section.widthAnchor].active = YES;
-    } else if (snapshot != nil) {
+    if (snapshot) {
+        NSMutableArray *mainWindows = [NSMutableArray new];
+        NSMutableArray *modelWindows = [NSMutableArray new];
         for (TBUsageWindow *window in snapshot.windows) {
-            NSView *row = [self usageRow:window];
+            BOOL primary = !claude || [window.identifier isEqual:@"claude-session"] || [window.identifier isEqual:@"claude-weekly"];
+            [(primary ? mainWindows : modelWindows) addObject:window];
+        }
+        NSArray *visibleWindows = self.modelLimitsExpanded || mainWindows.count == 0
+            ? snapshot.windows : mainWindows;
+        for (TBUsageWindow *window in visibleWindows) {
+            NSView *row = [self usageRow:window accent:accent];
             [section addArrangedSubview:row];
             [row.widthAnchor constraintEqualToAnchor:section.widthAnchor].active = YES;
         }
-    } else {
-        NSStackView *state = [NSStackView new];
-        state.orientation = NSUserInterfaceLayoutOrientationVertical;
-        state.alignment = NSLayoutAttributeLeading;
-        state.spacing = 9;
-        state.edgeInsets = NSEdgeInsetsMake(11, 11, 11, 11);
-        state.wantsLayer = YES;
-        state.layer.backgroundColor = NSColor.quaternaryLabelColor.CGColor;
-        state.layer.cornerRadius = 10;
-
-        NSString *message = needsConnection
-            ? @"Connect Claude Code to show exact usage."
-            : (error.length > 0 ? error : @"Usage is temporarily unavailable.");
-        NSTextField *messageLabel = TBLabel(message, 12, NSFontWeightRegular);
-        messageLabel.textColor = NSColor.secondaryLabelColor;
-        messageLabel.maximumNumberOfLines = 3;
-        messageLabel.lineBreakMode = NSLineBreakByWordWrapping;
-        [state addArrangedSubview:messageLabel];
-        [messageLabel.widthAnchor constraintLessThanOrEqualToAnchor:state.widthAnchor constant:-22].active = YES;
-
-        if (needsConnection) {
-            NSString *buttonTitle = self.connectingClaude ? @"Connecting…" : @"Connect Claude";
-            NSButton *button = [NSButton buttonWithTitle:buttonTitle
-                                                  target:self
-                                                  action:@selector(connectClaudePressed:)];
-            button.bezelStyle = NSBezelStyleRounded;
-            button.contentTintColor = TBAccentColor();
-            button.enabled = !self.connectingClaude;
-            [state addArrangedSubview:button];
+        if (modelWindows.count > 0 && mainWindows.count > 0) {
+            NSString *label = [NSString stringWithFormat:@"%lu model limit%@", (unsigned long)modelWindows.count, modelWindows.count == 1 ? @"" : @"s"];
+            NSButton *disclosure = [NSButton buttonWithTitle:label target:self action:@selector(toggleModelLimits:)];
+            disclosure.bordered = NO;
+            disclosure.font = [NSFont systemFontOfSize:10];
+            disclosure.contentTintColor = NSColor.secondaryLabelColor;
+            for (TBUsageWindow *window in modelWindows) if (window.usedPercent >= 75) disclosure.contentTintColor = NSColor.systemOrangeColor;
+            disclosure.image = [NSImage imageWithSystemSymbolName:self.modelLimitsExpanded ? @"chevron.down" : @"chevron.right" accessibilityDescription:nil];
+            disclosure.imagePosition = NSImageLeft;
+            disclosure.imageScaling = NSImageScaleProportionallyDown;
+            disclosure.toolTip = @"Show or hide additional model-specific weekly allowances";
+            [section addArrangedSubview:disclosure];
         }
-        [section addArrangedSubview:state];
-        [state.widthAnchor constraintEqualToAnchor:section.widthAnchor].active = YES;
+    } else if (loading) {
+        NSTextField *label = TBLabel(@"Reading your plan usage…", 11, NSFontWeightRegular);
+        label.textColor = NSColor.secondaryLabelColor;
+        [section addArrangedSubview:label];
+    }
+    if (error.length > 0 || (!snapshot && !loading)) {
+        NSString *message = error.length ? error : @"Usage is temporarily unavailable.";
+        if ([error containsString:@"rate limiting"]) {
+            NSDate *retry = snapshot.nextRefreshAt ?: self.nextAutomaticRefreshAt;
+            message = retry.timeIntervalSinceNow > 0
+                ? [@"Rate limited. Retrying in " stringByAppendingString:TBDuration(retry.timeIntervalSinceNow)]
+                : @"Rate limited. Waiting to retry.";
+        }
+        NSTextField *issue = TBLabel(message, 11, NSFontWeightRegular);
+        issue.textColor = NSColor.secondaryLabelColor;
+        issue.maximumNumberOfLines = 3;
+        issue.lineBreakMode = NSLineBreakByWordWrapping;
+        issue.toolTip = error;
+        [section addArrangedSubview:issue];
+        [issue.widthAnchor constraintEqualToAnchor:section.widthAnchor].active = YES;
+    }
+    if (claude && (self.claudeNeedsAuthorization || self.claudeNeedsConnection)) {
+        NSButton *action = [NSButton buttonWithTitle:self.connectingClaude ? @"Connecting…" :
+            self.claudeNeedsAuthorization ? @"Authorize Claude access" : @"Connect Claude"
+            target:self action:self.claudeNeedsAuthorization ? @selector(authorizeClaudePressed:) : @selector(connectClaudePressed:)];
+        action.bezelStyle = NSBezelStyleRounded;
+        action.controlSize = NSControlSizeSmall;
+        action.enabled = !self.connectingClaude;
+        [section addArrangedSubview:action];
     }
     return section;
 }
 
-- (NSView *)usageRow:(TBUsageWindow *)window {
-    NSStackView *row = [NSStackView new];
-    row.orientation = NSUserInterfaceLayoutOrientationVertical;
-    row.alignment = NSLayoutAttributeLeading;
-    row.spacing = 7;
-
-    double percent = MIN(MAX(window.usedPercent, 0), 100);
-    NSTextField *title = TBLabel(window.title, 12, NSFontWeightMedium);
-    NSTextField *value = TBLabel([NSString stringWithFormat:@"%.0f%%", percent],
-                                12, NSFontWeightSemibold);
-    value.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightSemibold];
-    NSStackView *labelRow = [NSStackView stackViewWithViews:@[title, value]];
-    labelRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    labelRow.distribution = NSStackViewDistributionEqualSpacing;
-    [row addArrangedSubview:labelRow];
-    [labelRow.widthAnchor constraintEqualToAnchor:row.widthAnchor].active = YES;
+- (NSView *)usageRow:(TBUsageWindow *)window accent:(NSColor *)accent {
+    NSString *title = window.title;
+    if ([window.identifier isEqualToString:@"claude-session"]) title = @"Session";
+    if ([window.identifier isEqualToString:@"claude-weekly"]) title = @"Weekly";
+    title = [title stringByReplacingOccurrencesOfString:@"Weekly · " withString:@"Weekly, "];
+    NSTextField *name = TBLabel(title, 12, NSFontWeightMedium);
+    name.toolTip = window.title;
+    NSTextField *value = TBLabel([TBPercent(window.usedPercent) stringByAppendingString:@" used"], 12, NSFontWeightMedium);
+    value.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightMedium];
+    NSStackView *labels = TBStack(@[name, TBSpacer(), value], NO, 4);
 
     TBProgressView *progress = [TBProgressView new];
-    progress.value = percent;
-    if (percent >= 90) {
-        progress.barColor = [NSColor colorWithSRGBRed:0.72 green:0.25 blue:0.22 alpha:1];
-    } else if (percent >= 75) {
-        progress.barColor = [NSColor colorWithSRGBRed:0.72 green:0.48 blue:0.16 alpha:1];
-    } else {
-        progress.barColor = TBAccentColor();
-    }
-    [progress.heightAnchor constraintEqualToConstant:7].active = YES;
-    [row addArrangedSubview:progress];
-    [progress.widthAnchor constraintEqualToAnchor:row.widthAnchor].active = YES;
+    progress.value = window.usedPercent;
+    progress.barColor = window.usedPercent >= 90 ? NSColor.systemRedColor :
+        window.usedPercent >= 75 ? NSColor.systemOrangeColor : accent;
+    [progress.heightAnchor constraintEqualToConstant:5].active = YES;
+    progress.toolTip = [NSString stringWithFormat:@"%@ used, %@ remaining", TBPercent(window.usedPercent), TBPercent(100 - window.usedPercent)];
+    [progress setAccessibilityElement:YES];
+    [progress setAccessibilityLabel:[title stringByAppendingString:@" usage"]];
+    [progress setAccessibilityValue:TBPercent(window.usedPercent)];
 
-    NSTextField *remaining = TBLabel([NSString stringWithFormat:@"%.0f%% remaining", 100 - percent],
-                                    10, NSFontWeightRegular);
-    remaining.textColor = NSColor.secondaryLabelColor;
-    NSMutableArray<NSView *> *metaViews = [NSMutableArray arrayWithObject:remaining];
-    if (window.resetsAt != nil) {
-        NSRelativeDateTimeFormatter *relative = [NSRelativeDateTimeFormatter new];
-        relative.unitsStyle = NSRelativeDateTimeFormatterUnitsStyleFull;
-        NSString *resetText = [relative localizedStringForDate:window.resetsAt relativeToDate:NSDate.date];
-        NSTextField *reset = TBLabel([@"Resets " stringByAppendingString:resetText],
-                                    10, NSFontWeightRegular);
-        reset.textColor = NSColor.secondaryLabelColor;
-        [metaViews addObject:reset];
+    NSString *reset = @"";
+    if (window.resetsAt) reset = window.resetsAt.timeIntervalSinceNow > 0
+        ? [@"Resets in " stringByAppendingString:TBDuration(window.resetsAt.timeIntervalSinceNow)]
+        : @"Reset passed. Awaiting update.";
+    NSTextField *resetLabel = TBLabel(reset, 10, NSFontWeightRegular);
+    resetLabel.textColor = NSColor.secondaryLabelColor;
+    if (window.resetsAt) {
+        NSDateFormatter *formatter = [NSDateFormatter new];
+        formatter.dateStyle = NSDateFormatterFullStyle;
+        formatter.timeStyle = NSDateFormatterShortStyle;
+        resetLabel.toolTip = [formatter stringFromDate:window.resetsAt];
     }
-    NSStackView *meta = [NSStackView stackViewWithViews:metaViews];
-    meta.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    meta.distribution = NSStackViewDistributionEqualSpacing;
-    [row addArrangedSubview:meta];
-    [meta.widthAnchor constraintEqualToAnchor:row.widthAnchor].active = YES;
+    NSTextField *remaining = TBLabel([TBPercent(100 - window.usedPercent) stringByAppendingString:@" left"], 10, NSFontWeightRegular);
+    remaining.textColor = NSColor.secondaryLabelColor;
+    NSStackView *meta = TBStack(@[resetLabel, TBSpacer(), remaining], NO, 4);
+    NSStackView *row = TBStack(@[labels, progress, meta], YES, 6);
+    for (NSView *child in row.arrangedSubviews) [child.widthAnchor constraintEqualToAnchor:row.widthAnchor].active = YES;
     return row;
 }
 
-- (void)refreshPressed:(id)sender {
-    if (self.onRefresh) self.onRefresh();
+- (void)toggleModelLimits:(id)sender {
+    self.modelLimitsExpanded = !self.modelLimitsExpanded;
+    [self render];
 }
 
-- (void)connectClaudePressed:(id)sender {
-    NSAlert *alert = [NSAlert new];
-    alert.messageText = @"Connect Claude Code?";
-    alert.informativeText = @"TokenBar will open Anthropic’s browser sign-in. Claude Code keeps the credential in macOS Keychain.";
-    [alert addButtonWithTitle:@"Connect"];
-    [alert addButtonWithTitle:@"Cancel"];
+- (void)refreshPressed:(id)sender { if (self.onRefresh) self.onRefresh(); }
+- (void)authorizeClaudePressed:(id)sender { if (self.onAuthorizeClaude) self.onAuthorizeClaude(); }
+- (void)connectClaudePressed:(id)sender { if (self.onConnectClaude) self.onConnectClaude(); }
 
-    __weak typeof(self) weakSelf = self;
-    [alert beginSheetModalForWindow:self.view.window
-                 completionHandler:^(NSModalResponse response) {
-                     if (response == NSAlertFirstButtonReturn && weakSelf.onConnectClaude) {
-                         weakSelf.onConnectClaude();
-                     }
-                 }];
+- (void)settingsPressed:(NSButton *)sender {
+    NSMenu *menu = [NSMenu new];
+    NSMenuItem *login = [[NSMenuItem alloc] initWithTitle:@"Launch at Login" action:@selector(toggleLaunchAtLogin:) keyEquivalent:@""];
+    login.target = self;
+    login.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:login];
+    [menu addItem:NSMenuItem.separatorItem];
+    NSMenuItem *usage = [[NSMenuItem alloc] initWithTitle:@"Open Claude Usage…" action:@selector(openClaudeUsage:) keyEquivalent:@""];
+    usage.target = self;
+    [menu addItem:usage];
+    [menu addItem:NSMenuItem.separatorItem];
+    NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:@"Quit TokenBar" action:@selector(quitPressed:) keyEquivalent:@"q"];
+    quit.target = self;
+    [menu addItem:quit];
+    [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, NSHeight(sender.bounds) + 5) inView:sender];
 }
 
-- (void)loginSwitchChanged:(NSSwitch *)sender {
+- (void)toggleLaunchAtLogin:(id)sender {
     NSError *error = nil;
-    BOOL enable = sender.state == NSControlStateValueOn;
-    BOOL success = enable
-        ? [SMAppService.mainAppService registerAndReturnError:&error]
-        : [SMAppService.mainAppService unregisterAndReturnError:&error];
-    if (!success) {
-        sender.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled
-            ? NSControlStateValueOn : NSControlStateValueOff;
-        self.settingsMessageLabel.stringValue = [NSString stringWithFormat:@"Could not update login setting: %@",
-                                                  error.localizedDescription];
-        self.settingsMessageLabel.hidden = NO;
-    } else {
-        self.settingsMessageLabel.hidden = YES;
-    }
+    BOOL enabled = SMAppService.mainAppService.status == SMAppServiceStatusEnabled;
+    BOOL success = enabled ? [SMAppService.mainAppService unregisterAndReturnError:&error]
+                          : [SMAppService.mainAppService registerAndReturnError:&error];
+    self.settingsMessageLabel.stringValue = success ? @"" : error.localizedDescription;
+    self.settingsMessageLabel.hidden = success;
+    [self render];
 }
 
 - (void)openClaudeUsage:(id)sender {
     [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"https://claude.ai/settings/usage"]];
 }
-
-- (void)quitPressed:(id)sender {
-    [NSApp terminate:nil];
-}
-
+- (void)quitPressed:(id)sender { [NSApp terminate:nil]; }
 @end
 
 @interface TBAppDelegate : NSObject <NSApplicationDelegate>
@@ -483,6 +402,8 @@ static NSBox *TBSeparator(void) {
 @property(nonatomic) TBClaudeUsageService *claudeService;
 @property(nonatomic) NSTimer *timer;
 @property(nonatomic) NSWindow *previewWindow;
+@property(nonatomic) NSDate *lastInteractionAt;
+@property(nonatomic) NSDate *lastRefreshAttemptAt;
 @end
 
 @implementation TBAppDelegate
@@ -501,11 +422,12 @@ static NSBox *TBSeparator(void) {
     [self.viewController loadView];
 
     __weak typeof(self) weakSelf = self;
-    self.viewController.onRefresh = ^{ [weakSelf refresh]; };
+    self.viewController.onRefresh = ^{ [weakSelf refreshWithUserInitiated:YES]; };
     self.viewController.onConnectClaude = ^{ [weakSelf connectClaude]; };
+    self.viewController.onAuthorizeClaude = ^{ [weakSelf authorizeClaude]; };
 
     self.popover = [NSPopover new];
-    self.popover.contentSize = NSMakeSize(382, 580);
+    self.popover.contentSize = NSMakeSize(TBPanelWidth, 350);
     self.popover.behavior = NSPopoverBehaviorTransient;
     self.popover.contentViewController = self.viewController;
 
@@ -516,12 +438,20 @@ static NSBox *TBSeparator(void) {
     button.target = self;
     button.action = @selector(togglePopover:);
 
+    self.viewController.codexLoading = NO;
+    self.viewController.claudeLoading = NO;
     [self refresh];
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:15 * 60
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:15
                                                  repeats:YES
                                                    block:^(NSTimer *timer) {
-                                                       [weakSelf refresh];
+                                                       [weakSelf timerTick];
                                                    }];
+
+    if ([NSProcessInfo.processInfo.arguments containsObject:@"--show-popover"]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self togglePopover:nil];
+        });
+    }
 
     BOOL previewRequested = NSProcessInfo.processInfo.environment[@"TOKENBAR_PREVIEW_WINDOW"] != nil ||
                             [NSProcessInfo.processInfo.arguments containsObject:@"--preview-window"];
@@ -529,12 +459,16 @@ static NSBox *TBSeparator(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
                            self.previewWindow = [[NSWindow alloc]
-                               initWithContentRect:NSMakeRect(0, 0, 382, 580)
+                               initWithContentRect:NSMakeRect(0, 0, TBPanelWidth, self.viewController.preferredContentSize.height)
                                          styleMask:NSWindowStyleMaskTitled |
                                                    NSWindowStyleMaskClosable
                                            backing:NSBackingStoreBuffered
                                              defer:NO];
                            self.previewWindow.title = @"TokenBar Preview";
+                           self.previewWindow.releasedWhenClosed = NO;
+                           self.lastInteractionAt = NSDate.date;
+                           [self updateSchedule];
+                           [self.viewController render];
                            self.previewWindow.contentViewController = self.viewController;
                            [self.previewWindow center];
                            [self.previewWindow makeKeyAndOrderFront:nil];
@@ -543,48 +477,116 @@ static NSBox *TBSeparator(void) {
     }
 }
 
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {
+    if (!self.popover.shown && !self.previewWindow.visible) [self togglePopover:nil];
+    return YES;
+}
+
 - (void)togglePopover:(id)sender {
     if (self.popover.shown) {
         [self.popover performClose:nil];
     } else {
+        self.lastInteractionAt = NSDate.date;
+        [self refreshWithUserInitiated:NO];
         [self.popover showRelativeToRect:self.statusItem.button.bounds
                                   ofView:self.statusItem.button
                            preferredEdge:NSRectEdgeMinY];
+        [self.viewController render];
         [self.popover.contentViewController.view.window makeKeyWindow];
     }
 }
 
-- (void)refresh {
-    self.viewController.codexLoading = YES;
-    self.viewController.claudeLoading = YES;
-    [self.viewController render];
+- (NSDate *)nextAutomaticRefresh {
+    NSDate *now = NSDate.date;
+    NSProcessInfo *process = NSProcessInfo.processInfo;
+    BOOL recentlyViewed = self.popover.shown || self.previewWindow.visible ||
+        (self.lastInteractionAt && [now timeIntervalSinceDate:self.lastInteractionAt] <= 5 * 60);
+    // Keep the visible panel current even when macOS gives this utility a low-power budget.
+    // Thermal pressure and idle low-power operation still use the slower cadence.
+    BOOL constrained = process.thermalState >= NSProcessInfoThermalStateSerious ||
+        (process.lowPowerModeEnabled && !recentlyViewed);
+    if (NSProcessInfo.processInfo.environment[@"TOKENBAR_DEBUG_REFRESH"]) {
+        NSLog(@"TokenBar refresh policy: interacted=%d lowPower=%d thermal=%ld interval=%.0f",
+            self.lastInteractionAt != nil, process.lowPowerModeEnabled, (long)process.thermalState,
+            [TBRefreshPolicy intervalAt:now lastInteraction:self.lastInteractionAt constrained:constrained]);
+    }
+    return [TBRefreshPolicy nextRefreshAt:now snapshot:self.viewController.claudeSnapshot
+        lastAttempt:self.lastRefreshAttemptAt lastInteraction:self.lastInteractionAt constrained:constrained
+        earliestRequest:self.claudeService.nextRequestAt retrying:self.viewController.claudeError.length > 0];
+}
 
+- (void)updateSchedule {
+    self.viewController.nextAutomaticRefreshAt = [self nextAutomaticRefresh];
+}
+
+- (void)timerTick {
+    NSDate *next = [self nextAutomaticRefresh];
+    if (next.timeIntervalSinceNow <= 0) [self refreshWithUserInitiated:NO];
+    [self updateSchedule];
+    [self updateStatusTitle];
+    if (self.popover.shown || self.previewWindow.visible) [self.viewController render];
+}
+
+- (void)refresh { [self refreshWithUserInitiated:NO]; }
+
+- (void)refreshWithUserInitiated:(BOOL)userInitiated {
+    if (self.viewController.codexLoading || self.viewController.claudeLoading || self.viewController.connectingClaude) return;
+    NSDate *now = NSDate.date;
+    if (userInitiated) self.lastInteractionAt = now;
+    BOOL codexDue = !self.viewController.codexSnapshot ||
+        [now timeIntervalSinceDate:self.viewController.codexSnapshot.fetchedAt] >= 60;
+    BOOL claudeDue = !self.viewController.claudeSnapshot || !self.claudeService.nextRequestAt ||
+        self.claudeService.nextRequestAt.timeIntervalSinceNow <= 0;
+    if (!codexDue && !claudeDue) {
+        [self updateSchedule];
+        [self.viewController render];
+        return;
+    }
+    self.lastRefreshAttemptAt = now;
+    self.viewController.codexLoading = codexDue;
+    self.viewController.claudeLoading = claudeDue;
+    [self.viewController render];
     __weak typeof(self) weakSelf = self;
-    [self.codexService fetchWithCompletion:^(TBProviderSnapshot *snapshot, NSError *error) {
+    if (codexDue) [self.codexService fetchWithCompletion:^(TBProviderSnapshot *snapshot, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) self = weakSelf;
-            if (self == nil) return;
+            if (!self) return;
             self.viewController.codexLoading = NO;
-            self.viewController.codexSnapshot = snapshot;
+            if (snapshot) self.viewController.codexSnapshot = snapshot;
             self.viewController.codexError = error.localizedDescription;
-            if (snapshot != nil) self.viewController.lastUpdated = snapshot.fetchedAt;
+            [self updateSchedule];
             [self updateStatusTitle];
             [self.viewController render];
         });
     }];
-
-    [self.claudeService fetchWithCompletion:^(TBProviderSnapshot *snapshot, NSError *error) {
+    if (claudeDue) [self.claudeService fetchWithUserInitiated:userInitiated completion:^(TBProviderSnapshot *snapshot, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) self = weakSelf;
-            if (self == nil) return;
+            if (!self) return;
             self.viewController.claudeLoading = NO;
             self.viewController.claudeSnapshot = snapshot;
-            self.viewController.claudeNeedsConnection = [error.localizedDescription isEqualToString:@"CONNECT_CLAUDE"];
-            self.viewController.claudeError = self.viewController.claudeNeedsConnection
-                ? nil : error.localizedDescription;
-            if (snapshot != nil) self.viewController.lastUpdated = snapshot.fetchedAt;
+            self.viewController.claudeNeedsConnection = [error.domain isEqualToString:TBUsageErrorDomain] && error.code == TBClaudeErrorSignInRequired;
+            self.viewController.claudeNeedsAuthorization = [error.domain isEqualToString:TBUsageErrorDomain] && error.code == TBClaudeErrorKeychainAccess;
+            self.viewController.claudeError = error.localizedDescription;
+            [self updateSchedule];
             [self updateStatusTitle];
             [self.viewController render];
+        });
+    }];
+}
+
+- (void)authorizeClaude {
+    self.viewController.connectingClaude = YES;
+    [self.viewController render];
+    __weak typeof(self) weakSelf = self;
+    [self.claudeService authorizeWithCompletion:^(NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) self = weakSelf;
+            if (!self) return;
+            self.viewController.connectingClaude = NO;
+            self.viewController.settingsMessageLabel.stringValue = error ? error.localizedDescription : @"Claude access authorized.";
+            self.viewController.settingsMessageLabel.hidden = NO;
+            [self refreshWithUserInitiated:YES];
         });
     }];
 }
@@ -608,7 +610,7 @@ static NSBox *TBSeparator(void) {
             } else {
                 self.viewController.settingsMessageLabel.stringValue = @"Claude connected.";
                 self.viewController.settingsMessageLabel.hidden = NO;
-                [self refresh];
+                [self refreshWithUserInitiated:YES];
             }
         });
     }];
@@ -619,8 +621,15 @@ static NSBox *TBSeparator(void) {
                                        identifier:@"codex-weekly"];
     NSString *claude = [self percentageForSnapshot:self.viewController.claudeSnapshot
                                         identifier:@"claude-session"];
+    if (self.viewController.claudeSnapshot &&
+        (self.viewController.claudeError.length > 0 ||
+         [NSDate.date timeIntervalSinceDate:self.viewController.claudeSnapshot.fetchedAt] >= 6 * 60)) {
+        claude = [@"~" stringByAppendingString:claude];
+    }
     self.statusItem.button.attributedTitle = [self statusTitleWithCodex:codex claude:claude];
-    self.statusItem.button.toolTip = @"Codex weekly · Claude 5-hour session";
+    self.statusItem.button.toolTip = self.viewController.claudeError.length > 0
+        ? [@"Claude: " stringByAppendingString:self.viewController.claudeError]
+        : @"Codex weekly · Claude 5-hour session";
 }
 
 - (NSAttributedString *)statusTitleWithCodex:(NSString *)codex claude:(NSString *)claude {
@@ -632,7 +641,7 @@ static NSBox *TBSeparator(void) {
     };
     NSDictionary *codexMark = @{
         NSFontAttributeName: [NSFont systemFontOfSize:7 weight:NSFontWeightBold],
-        NSForegroundColorAttributeName: [NSColor colorWithSRGBRed:0.18 green:0.68 blue:0.47 alpha:1],
+        NSForegroundColorAttributeName: [NSColor colorWithSRGBRed:0.37 green:0.59 blue:0.88 alpha:1],
         NSBaselineOffsetAttributeName: @1,
     };
     NSDictionary *claudeMark = @{
@@ -658,7 +667,7 @@ static NSBox *TBSeparator(void) {
 - (NSString *)percentageForSnapshot:(TBProviderSnapshot *)snapshot identifier:(NSString *)identifier {
     for (TBUsageWindow *window in snapshot.windows) {
         if ([window.identifier isEqualToString:identifier]) {
-            return [NSString stringWithFormat:@"%.0f%%", MIN(MAX(window.usedPercent, 0), 100)];
+            return TBPercent(window.usedPercent);
         }
     }
     return @"--";
@@ -669,6 +678,9 @@ static NSBox *TBSeparator(void) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         NSApplication *application = NSApplication.sharedApplication;
+        for (NSRunningApplication *other in [NSRunningApplication runningApplicationsWithBundleIdentifier:NSBundle.mainBundle.bundleIdentifier]) {
+            if (other.processIdentifier != NSProcessInfo.processInfo.processIdentifier) return 0;
+        }
         application.activationPolicy = NSApplicationActivationPolicyAccessory;
         TBAppDelegate *delegate = [TBAppDelegate new];
         application.delegate = delegate;
