@@ -51,6 +51,18 @@ static NSBox *TBSeparator(void) {
 
 static const CGFloat TBPanelWidth = 344;
 
+static NSTextField *TBMessageLabel(NSString *text) {
+    NSTextField *label = TBLabel(text, 11, NSFontWeightRegular);
+    label.textColor = NSColor.secondaryLabelColor;
+    label.maximumNumberOfLines = 3;
+    label.usesSingleLineMode = NO;
+    label.lineBreakMode = NSLineBreakByWordWrapping;
+    label.preferredMaxLayoutWidth = TBPanelWidth - 32;
+    [label setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                  forOrientation:NSLayoutConstraintOrientationHorizontal];
+    return label;
+}
+
 static NSColor *TBProviderColor(BOOL claude) {
     return claude ? [NSColor colorWithSRGBRed:0.83 green:0.48 blue:0.35 alpha:1]
                   : [NSColor colorWithSRGBRed:0.37 green:0.59 blue:0.88 alpha:1];
@@ -106,6 +118,7 @@ static NSButton *TBSymbolButton(NSString *symbol, NSString *label, id target, SE
 @property(nonatomic, copy) dispatch_block_t onRefresh;
 @property(nonatomic, copy) dispatch_block_t onConnectClaude;
 @property(nonatomic, copy) dispatch_block_t onAuthorizeClaude;
+@property(nonatomic, copy) void (^onContentSizeChanged)(NSSize size);
 @property(nonatomic, nullable) TBProviderSnapshot *codexSnapshot;
 @property(nonatomic, nullable) TBProviderSnapshot *claudeSnapshot;
 @property(nonatomic, nullable, copy) NSString *codexError;
@@ -133,14 +146,13 @@ static NSButton *TBSymbolButton(NSString *symbol, NSString *label, id target, SE
     root.material = NSVisualEffectMaterialPopover;
     root.blendingMode = NSVisualEffectBlendingModeBehindWindow;
     root.state = NSVisualEffectStateActive;
+    root.translatesAutoresizingMaskIntoConstraints = NO;
+    [root.widthAnchor constraintEqualToConstant:TBPanelWidth].active = YES;
     self.view = root;
 
     self.contentStack = TBStack(@[], YES, 16);
     self.contentStack.edgeInsets = NSEdgeInsetsMake(4, 0, 4, 0);
-    self.settingsMessageLabel = TBLabel(@"", 11, NSFontWeightRegular);
-    self.settingsMessageLabel.textColor = NSColor.secondaryLabelColor;
-    self.settingsMessageLabel.maximumNumberOfLines = 3;
-    self.settingsMessageLabel.lineBreakMode = NSLineBreakByWordWrapping;
+    self.settingsMessageLabel = TBMessageLabel(@"");
     self.settingsMessageLabel.hidden = YES;
 
     self.outerStack = TBStack(@[[self headerView], self.contentStack, self.settingsMessageLabel,
@@ -208,11 +220,15 @@ static NSButton *TBSymbolButton(NSString *symbol, NSString *label, id target, SE
         next && next.timeIntervalSinceNow > 0
             ? [@"Next check in " stringByAppendingString:TBDuration(next.timeIntervalSinceNow)]
             : @"Automatic refresh";
+    if (!loading && self.claudeNeedsAuthorization) self.scheduleLabel.stringValue = @"Claude needs permission";
+    else if (!loading && self.claudeNeedsConnection) self.scheduleLabel.stringValue = @"Connect Claude to update usage";
     self.scheduleLabel.toolTip = @"Claude checks are spaced at least 5 minutes apart. Checks slow down while idle and respect provider cooldowns.";
     [self.view layoutSubtreeIfNeeded];
     CGFloat height = MAX(220, ceil(self.outerStack.fittingSize.height));
     self.preferredContentSize = NSMakeSize(TBPanelWidth, height);
-    [self.view setFrameSize:self.preferredContentSize];
+    // AppKit owns the hosted view's frame. Resizing it here fights NSPopover's
+    // layout engine and can grow the window independently of the visible content.
+    if (self.onContentSizeChanged) self.onContentSizeChanged(self.preferredContentSize);
     if ([self.view.window.title isEqualToString:@"TokenBar Preview"]) {
         [self.view.window setContentSize:self.preferredContentSize];
     }
@@ -224,6 +240,7 @@ static NSButton *TBSymbolButton(NSString *symbol, NSString *label, id target, SE
     NSColor *accent = TBProviderColor(claude);
     NSString *iconName = claude ? @"ProviderIcon-claude" : @"ProviderIcon-codex";
     NSImage *image = [[NSImage alloc] initWithContentsOfFile:[NSBundle.mainBundle pathForResource:iconName ofType:@"svg"]];
+    if (!image) image = [NSImage imageWithSystemSymbolName:claude ? @"sun.max" : @"terminal" accessibilityDescription:title];
     image.template = YES;
     NSImageView *icon = [NSImageView imageViewWithImage:image];
     icon.contentTintColor = claude ? accent : NSColor.labelColor;
@@ -284,17 +301,20 @@ static NSButton *TBSymbolButton(NSString *symbol, NSString *label, id target, SE
         [section addArrangedSubview:label];
     }
     if (error.length > 0 || (!snapshot && !loading)) {
-        NSString *message = error.length ? error : @"Usage is temporarily unavailable.";
-        if ([error containsString:@"rate limiting"]) {
+        NSString *message = snapshot ? @"Couldn’t refresh. Showing the last measurement." : @"Couldn’t load usage. Try refreshing.";
+        if (claude && self.claudeNeedsAuthorization) {
+            message = @"Allow access to refresh Claude usage.";
+        } else if (claude && self.claudeNeedsConnection) {
+            message = @"Connect Claude Code to see your usage.";
+        } else if ([error containsString:@"expired"] || [error containsString:@"rejected this session"]) {
+            message = @"Open Claude Code to renew your session.";
+        } else if ([error containsString:@"rate limiting"]) {
             NSDate *retry = snapshot.nextRefreshAt ?: self.nextAutomaticRefreshAt;
             message = retry.timeIntervalSinceNow > 0
                 ? [@"Rate limited. Retrying in " stringByAppendingString:TBDuration(retry.timeIntervalSinceNow)]
                 : @"Rate limited. Waiting to retry.";
         }
-        NSTextField *issue = TBLabel(message, 11, NSFontWeightRegular);
-        issue.textColor = NSColor.secondaryLabelColor;
-        issue.maximumNumberOfLines = 3;
-        issue.lineBreakMode = NSLineBreakByWordWrapping;
+        NSTextField *issue = TBMessageLabel(message);
         issue.toolTip = error;
         [section addArrangedSubview:issue];
         [issue.widthAnchor constraintEqualToAnchor:section.widthAnchor].active = YES;
@@ -425,11 +445,15 @@ static NSButton *TBSymbolButton(NSString *symbol, NSString *label, id target, SE
     self.viewController.onRefresh = ^{ [weakSelf refreshWithUserInitiated:YES]; };
     self.viewController.onConnectClaude = ^{ [weakSelf connectClaude]; };
     self.viewController.onAuthorizeClaude = ^{ [weakSelf authorizeClaude]; };
+    self.viewController.onContentSizeChanged = ^(NSSize size) {
+        typeof(self) self = weakSelf;
+        if (self.popover && !NSEqualSizes(self.popover.contentSize, size)) self.popover.contentSize = size;
+    };
 
     self.popover = [NSPopover new];
-    self.popover.contentSize = NSMakeSize(TBPanelWidth, 350);
     self.popover.behavior = NSPopoverBehaviorTransient;
     self.popover.contentViewController = self.viewController;
+    self.popover.contentSize = self.viewController.preferredContentSize;
 
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
     self.statusItem.autosaveName = @"TokenBarStatusItem";

@@ -133,6 +133,14 @@ Run the parser and Claude service regression tests (synthetic credentials, an in
 bash scripts/test.sh
 ```
 
+Check native popover sizing, including permission errors, long diagnostics and model-limit expansion:
+
+```bash
+bash scripts/test_layout.sh
+```
+
+The layout checks require a macOS graphical login session. They construct offscreen views with synthetic data and make no provider requests or credential reads.
+
 Build an ad-hoc signed application:
 
 ```bash
