@@ -44,8 +44,8 @@
 ### Build and open TokenBar
 
 ```bash
-git clone https://github.com/Prajwal-ak-0/token-usage-monitor.git
-cd token-usage-monitor
+git clone https://github.com/Prajwal-ak-0/tokenbar.git
+cd tokenbar
 bash scripts/test.sh
 bash scripts/package_app.sh
 ditto dist/TokenBar.app /Applications/TokenBar.app
@@ -73,8 +73,8 @@ TokenBar is intentionally conservative with credentials and provider requests.
 | Protection | Behavior |
 | --- | --- |
 | Credentials | Read from the providers' existing local sign-in state, held only in memory, and never written by TokenBar |
-| Claude polling | At most one Anthropic usage request every 15 minutes |
-| Rate limits | HTTP 429 responses trigger persistent exponential backoff and respect `Retry-After` |
+| Claude polling | At most one Anthropic usage attempt every 5 minutes; repeated Refresh clicks share cached data |
+| Rate limits | HTTP 429 responses trigger persistent 5–30 minute exponential backoff and respect numeric or HTTP-date `Retry-After`, including longer server delays |
 | Offline behavior | The last successful Claude response remains available during rate limits and temporary network failures |
 | Local cache | Stored as JSON data in macOS preferences; no access token is included |
 
@@ -86,12 +86,22 @@ TokenBar queries the local Codex app server through `account/rateLimits/read` an
 
 ### Claude
 
-TokenBar reads the existing Claude Code OAuth credential from macOS Keychain and requests usage from Anthropic's authenticated Claude usage endpoint. This endpoint is not a documented public API and may change; TokenBar uses conservative polling, persistent caching, and rate-limit backoff to avoid unnecessary traffic.
+TokenBar reads the existing Claude Code OAuth credential from macOS Keychain and requests usage from Anthropic's authenticated Claude usage endpoint. Background reads prohibit Keychain interaction; **Authorize Claude access** is a separate manual action if permission is unavailable. Token expiry and HTTP 401/403 are distinguished from missing credentials, so an access problem does not automatically request a new browser login. For an expired token, manual **Refresh** lets Claude Code attempt renewal through its local `/status` command; background refresh never launches that CLI, and TokenBar never exchanges Claude Code's rotating refresh token. The CLI owns its own credential behavior and may request permission during that manual recovery. This endpoint is not a documented public API and may change; TokenBar uses conservative polling, persistent caching, and rate-limit backoff to avoid unnecessary traffic.
+
+### Refresh and recovery
+
+Each provider shows the age of its own measurement. Hover for the exact capture time; cached values keep their original timestamp. Percentages preserve fractional values, and Claude's plan is derived from its credential instead of assuming Max. Reset countdowns are computed locally; a passed reset triggers a fresh measurement when eligible and never invents a zero-percent value.
+
+Automatic checks adapt to interaction: every 5 minutes for an hour after opening the panel, every 15 minutes for the following three hours, and every 30 minutes when idle longer, during idle Low Power Mode, or under serious thermal pressure. Recent panel interaction retains the five-minute cadence in Low Power Mode. Opening the panel checks eligible data immediately. UI countdowns update locally every 15 seconds without provider requests. Persisted cooldowns take priority over resets, manual Refresh, app restarts and adaptive scheduling.
+
+Model-specific limits are available behind a disclosure below Claude's primary rows; the disclosure turns amber when an additional limit reaches 75%. Settings, including **Launch at Login** and **Quit TokenBar**, live in the gear menu. TokenBar allows one running instance per app bundle identifier; separate monitors such as CodexBar have their own polling schedules.
+
+A freshly built app may need a new macOS Keychain grant. Claude Code can also rotate or recreate its Keychain item. TokenBar keeps this permission problem separate from account authentication, but cannot guarantee that macOS will never ask again.
 
 ## Updating
 
 ```bash
-cd token-usage-monitor
+cd tokenbar
 git pull
 bash scripts/test.sh
 bash scripts/package_app.sh
@@ -105,14 +115,19 @@ open /Applications/TokenBar.app
 | Problem | What to do |
 | --- | --- |
 | TokenBar is not visible | Run `open /Applications/TokenBar.app` |
-| Claude is disconnected | Open TokenBar and select **Connect Claude** |
-| Usage looks stale | Cached data is expected between 15-minute refreshes or while a provider is rate-limiting requests |
+| Claude has no saved sign-in | Select **Connect Claude**; only this action starts browser sign-in |
+| Claude Keychain access is unavailable | Select **Authorize Claude access** to grant the installed app access; if macOS asks for your password, enter it yourself |
+| Claude session expired | Open Claude Code to renew the session, then click **Refresh**; manual Refresh also tries Claude Code's local renewal path |
+| Claude returns HTTP 403 | Check account permissions on the Claude usage page; repeated sign-in is not assumed to fix it |
+| Claude is rate limited | Wait until the displayed next check; manual Refresh and restarts preserve the cooldown |
+| Multiple usage monitors are running | Keep one Claude monitor active to avoid polling the same endpoint from multiple apps |
+| Usage looks stale | Check Claude’s capture age, next-check time and any error below the bars; `~` in the menu bar marks stale Claude data |
 | TokenBar is in the wrong position | Hold Command and drag it to the preferred menu-bar position |
 | The build fails after moving the project | Remove `.build`, then run `bash scripts/package_app.sh` again |
 
 ## Development
 
-Run the parser and cache regression tests:
+Run the parser and Claude service regression tests (synthetic credentials, an injected clock, in-memory preferences and stubbed responses; no real Keychain or API calls):
 
 ```bash
 bash scripts/test.sh
@@ -125,6 +140,10 @@ bash scripts/package_app.sh
 ```
 
 The generated application is written to `dist/TokenBar.app`.
+
+## Design references
+
+The panel uses native AppKit vibrancy, system typography and SF Symbols. Provider SVG marks come from [CodexBar](https://github.com/steipete/CodexBar), with its MIT notice included in `Resources/ProviderIcons-LICENSE.txt` and the packaged app. Refresh behavior was compared with CodexBar's [refresh-loop documentation](https://github.com/steipete/CodexBar/blob/main/docs/refresh-loop.md); TokenBar retains a five-minute Claude floor even during recent interaction.
 
 ## Project status
 
