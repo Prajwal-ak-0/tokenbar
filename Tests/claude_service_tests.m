@@ -23,6 +23,10 @@
 @property(nonatomic) NSDictionary *reply;
 @property(nonatomic) NSInteger requests;
 @property(nonatomic) NSInteger interactiveReads;
+@property(nonatomic) BOOL useCLI;
+@property(nonatomic) NSDictionary *cliReply;
+@property(nonatomic) NSInteger cliRequests;
+@property(nonatomic) NSInteger credentialReads;
 @end
 @implementation TBTestClaudeService
 - (instancetype)initWithDefaults:(NSUserDefaults *)defaults {
@@ -34,11 +38,14 @@
 }
 - (NSDate *)now { return self.clock; }
 - (NSDictionary *)readCredentialAllowingInteraction:(BOOL)allow error:(NSError **)error {
+    self.credentialReads++;
     if (allow) self.interactiveReads++;
     if (error) *error = self.credentialError;
     return self.credential;
 }
 - (NSDictionary *)requestUsageWithToken:(NSString *)token { self.requests++; return self.reply; }
+- (NSString *)usageCLIPath { return self.useCLI ? @"/synthetic/CodexBarCLI" : nil; }
+- (NSDictionary *)requestUsageWithCLIAtPath:(NSString *)path { self.cliRequests++; return self.cliReply; }
 @end
 
 static NSDictionary *Reply(NSInteger status, NSDictionary *headers, id payload) {
@@ -192,6 +199,85 @@ static void TestUnauthorizedAndForbidden(void) {
     }
 }
 
+static NSDictionary *CLIReply(NSDate *date, id percent) {
+    NSString *stamp = [[NSISO8601DateFormatter new] stringFromDate:date];
+    NSDictionary *entry = @{@"provider": @"claude", @"source": @"claude", @"usage": @{
+        @"updatedAt": stamp, @"loginMethod": @"Max", @"accountEmail": @"private@example.invalid",
+        @"primary": @{@"usedPercent": percent, @"resetsAt": @"2027-01-16T13:00:00Z"},
+        @"secondary": @{@"usedPercent": @7},
+        @"extraRateWindows": @[@{@"title": @"Fable only", @"window": @{@"usedPercent": @0, @"windowMinutes": @10080}}]}};
+    return @{@"status": @0, @"data": [NSJSONSerialization dataWithJSONObject:@[entry] options:0 error:nil]};
+}
+
+static void TestAutomaticCLIRenewalAndPersistence(void) {
+    TBMemoryDefaults *defaults;
+    TBTestClaudeService *service = Service(&defaults);
+    // Existing cached 42% and an inaccessible/expired credential must not block the owner CLI.
+    TBProviderSnapshot *old = Fetch(service, NO, NULL);
+    service.clock = [service.clock dateByAddingTimeInterval:300];
+    service.credential = nil;
+    service.useCLI = YES;
+    service.cliReply = CLIReply(service.clock, @7);
+    NSError *error;
+    TBProviderSnapshot *fresh = Fetch(service, NO, &error);
+    NSCAssert(!error && fresh.windows[0].usedPercent == 7 && fresh.windows.count == 3 && [fresh.plan isEqual:@"Max"],
+              @"Background CLI probe must recover real session, weekly and scoped windows without permission");
+    NSCAssert([fresh.fetchedAt compare:old.fetchedAt] == NSOrderedDescending && service.credentialReads == 1 &&
+              service.requests == 1 && service.cliRequests == 1 && !service.interactiveReads,
+              @"Preferred CLI must bypass both foreign Keychain and direct OAuth requests");
+    for (int i = 0; i < 10; i++) Fetch(service, YES, NULL);
+    NSCAssert(service.cliRequests == 1, @"CLI refresh clicks share the same five-minute throttle");
+    TBTestClaudeService *restarted = [[TBTestClaudeService alloc] initWithDefaults:defaults];
+    restarted.useCLI = YES;
+    restarted.clock = service.clock;
+    NSCAssert(Fetch(restarted, NO, &error) && !error && !restarted.cliRequests, @"Restart retains CLI cache and cooldown");
+    restarted.clock = [restarted.clock dateByAddingTimeInterval:300];
+    restarted.cliReply = CLIReply(restarted.clock, @9);
+    NSCAssert(Fetch(restarted, NO, &error).windows[0].usedPercent == 9 && !error && restarted.cliRequests == 1,
+              @"A subsequent scheduled refresh must update automatically without any authorization click");
+    NSCAssert(![defaults.values.description containsString:@"private@example.invalid"], @"Cache stores only quota fields, not CLI account identity");
+}
+
+static void TestCLIFailuresKeepOriginalCapture(void) {
+    TBTestClaudeService *service = Service(NULL);
+    service.useCLI = YES;
+    service.cliReply = CLIReply(service.clock, @7);
+    TBProviderSnapshot *first = Fetch(service, NO, NULL);
+    for (NSDictionary *reply in @[
+        CLIReply([service.clock dateByAddingTimeInterval:-3600], @80),
+        @{@"status": @1, @"data": [@"{\"error\":\"rate limited 429\"}" dataUsingEncoding:NSUTF8StringEncoding]},
+        @{@"status": @(-1)},
+        @{@"status": @0, @"data": [@"[]" dataUsingEncoding:NSUTF8StringEncoding]},
+        @{@"status": @1, @"data": CLIReply(service.clock, @10)[@"data"]}]) {
+        service.clock = service.nextRequestAt;
+        service.cliReply = reply;
+        NSError *error;
+        TBProviderSnapshot *cached = Fetch(service, NO, &error);
+        NSCAssert(error && [cached.fetchedAt isEqual:first.fetchedAt] && cached.windows[0].usedPercent == 7,
+                  @"Stale, failed or malformed CLI probes must not overwrite a valid measurement");
+        NSInteger attempts = service.cliRequests;
+        Fetch(service, YES, NULL);
+        NSCAssert(service.cliRequests == attempts && !service.requests && !service.credentialReads,
+                  @"CLI failure must retain cooldown and never bypass it by switching to OAuth");
+    }
+    for (NSNumber *delay in @[@600, @1200, @1800, @1800]) {
+        service.clock = service.nextRequestAt;
+        service.cliReply = @{@"status": @1, @"data": [@"rate_limit_error" dataUsingEncoding:NSUTF8StringEncoding]};
+        Fetch(service, NO, NULL);
+        // A previous 429 above contributes one attempt; verify growing, capped backoff.
+        NSCAssert([service.nextRequestAt timeIntervalSinceDate:service.clock] == delay.doubleValue,
+                  @"CLI rate limits must grow backoff rather than causing repeated probes");
+    }
+    for (id entry in @[
+        @{@"provider": @"claude", @"source": @"web", @"usage": @{}},
+        @{@"provider": @"codex", @"source": @"cli", @"usage": @{}}, NSNull.null]) {
+        NSError *error;
+        NSData *data = [NSJSONSerialization dataWithJSONObject:@[entry] options:0 error:nil];
+        NSCAssert(![TBClaudeUsageService claudePayloadFromCLIData:data error:&error] && error,
+                  @"Unexpected providers, browser accounts and malformed rows must be rejected");
+    }
+}
+
 // Exercise the real credential reader, replacing only the OS calls. The older tests
 // mocked the whole reader and could not detect a missing legacy no-dialog policy.
 @interface TBKeychainProbeService : TBClaudeUsageService
@@ -278,6 +364,8 @@ int main(void) {
         TestCredentialFailureClassification();
         TestExpiredCredentialsStaySilent();
         TestUnauthorizedAndForbidden();
+        TestAutomaticCLIRenewalAndPersistence();
+        TestCLIFailuresKeepOriginalCapture();
         TestKeychainNoDialogBoundary();
         TestExplicitAuthorizationBoundary();
         NSLog(@"TokenBar Claude service tests passed");

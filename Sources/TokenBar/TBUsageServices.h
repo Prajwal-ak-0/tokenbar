@@ -33,6 +33,9 @@ typedef NS_ENUM(NSInteger, TBClaudeErrorCode) {
 - (OSStatus)copyKeychainItemMatching:(NSDictionary *)query result:(CFTypeRef _Nullable *_Nullable)result;
 - (OSStatus)setKeychainInteractionAllowed:(BOOL)allowed;
 - (NSDictionary *)requestUsageWithToken:(NSString *)token;
+- (nullable NSString *)usageCLIPath;
+- (NSDictionary *)requestUsageWithCLIAtPath:(NSString *)path;
++ (nullable NSDictionary *)claudePayloadFromCLIData:(NSData *)data error:(NSError **)error;
 - (void)connectWithCompletion:(TBActionCompletion)completion;
 @end
 
