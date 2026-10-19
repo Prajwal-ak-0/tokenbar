@@ -40,6 +40,7 @@
 - [Apple Command Line Tools](#apple-command-line-tools)
 - Codex CLI installed and signed in
 - Claude Code installed and signed in
+- [CodexBar](https://github.com/steipete/CodexBar) installed in `/Applications` or `~/Applications` for automatic Claude credential renewal (its menu-bar app can remain closed)
 
 ### Build and open TokenBar
 
@@ -73,8 +74,8 @@ TokenBar is intentionally conservative with credentials and provider requests.
 | Protection | Behavior |
 | --- | --- |
 | Credentials | Read from the providers' existing local sign-in state, held only in memory, and never written by TokenBar |
-| Claude polling | At most one Anthropic usage attempt every 5 minutes; repeated Refresh clicks share cached data |
-| Rate limits | HTTP 429 responses trigger persistent 5–30 minute exponential backoff and respect numeric or HTTP-date `Retry-After`, including longer server delays |
+| Claude polling | At most one usage probe every 5 minutes; repeated Refresh clicks share cached data |
+| Rate limits | Persistent 5–30 minute exponential backoff for reported rate limits; the direct OAuth fallback also honors numeric or HTTP-date `Retry-After`, including longer server delays |
 | Offline behavior | The last successful Claude response remains available during rate limits and temporary network failures |
 | Local cache | Stored as JSON data in macOS preferences; no access token is included |
 
@@ -86,17 +87,21 @@ TokenBar queries the local Codex app server through `account/rateLimits/read` an
 
 ### Claude
 
-TokenBar reads the existing Claude Code OAuth credential from macOS Keychain and requests usage from Anthropic's authenticated Claude usage endpoint. Background and ordinary Refresh reads prohibit Keychain interaction with the process-wide legacy interaction switch, an explicit UI-fail query policy, and a noninteractive authentication context. **Authorize Claude access** is a separate manual action if permission is unavailable; only that action temporarily enables TokenBar's Keychain permission dialog. Token expiry and HTTP 401/403 are distinguished from missing credentials, so an access problem does not automatically request a new browser login. For an expired token, open Claude Code to renew its own credential, then click **Refresh**. TokenBar never launches Claude Code from background checks or ordinary Refresh, and never exchanges Claude Code's rotating refresh token. This avoids provider-owned Keychain prompts escaping TokenBar's no-dialog controls. This endpoint is not a documented public API and may change; TokenBar uses conservative polling, persistent caching, and rate-limit backoff to avoid unnecessary traffic.
+TokenBar prefers the installed CodexBar CLI adapter with explicit `--provider claude --source cli --format json`. The adapter reads Claude Code's built-in `/usage` screen through a temporary terminal session. Claude Code handles its own saved sign-in and token renewal, so TokenBar does not need a separate Keychain grant or a manually copied access token. This source follows the Claude Code account, rather than importing a potentially different browser account. The CodexBar menu-bar app does not need to run.
+
+The helper runs with Claude safe mode and automatic updates disabled. Only quota windows, reset times, plan and the source measurement timestamp enter TokenBar's cache; account identity and raw diagnostics are discarded. Old, malformed, failed or unexpected-source responses cannot be relabeled as fresh measurements. A failed probe retries automatically after the cooldown without switching to a second network source.
+
+If the adapter is not installed, TokenBar retains its direct OAuth compatibility path. That path silently reads Claude Code's existing Keychain credential and requests Anthropic's usage endpoint; explicit **Authorize Claude access** is available only for this fallback. Installing CodexBar enables the automatic CLI path on the next eligible check. TokenBar never exchanges Claude Code's rotating refresh token itself. These provider interfaces can change; errors remain visible beside the last successful measurement.
 
 ### Refresh and recovery
 
-Each provider shows the age of its own measurement. Hover for the exact capture time; cached values keep their original timestamp. Percentages preserve fractional values, and Claude's plan is derived from its credential instead of assuming Max. Reset countdowns are computed locally; a passed reset triggers a fresh measurement when eligible and never invents a zero-percent value.
+Each provider shows the age of its own measurement. Hover for the exact capture time; cached values keep their original timestamp. Percentages preserve fractional values, and Claude's plan comes from the selected source instead of assuming Max. CLI percentages have the precision reported by Claude Code's usage screen. Reset countdowns are computed locally; a passed reset triggers a fresh measurement when eligible and never invents a zero-percent value.
 
 Automatic checks adapt to interaction: every 5 minutes for an hour after opening the panel, every 15 minutes for the following three hours, and every 30 minutes when idle longer, during idle Low Power Mode, or under serious thermal pressure. Recent panel interaction retains the five-minute cadence in Low Power Mode. Opening the panel checks eligible data immediately. UI countdowns update locally every 15 seconds without provider requests. Persisted cooldowns take priority over resets, manual Refresh, app restarts and adaptive scheduling.
 
 Model-specific limits are available behind a disclosure below Claude's primary rows; the disclosure turns amber when an additional limit reaches 75%. Settings, including **Launch at Login** and **Quit TokenBar**, live in the gear menu. TokenBar allows one running instance per app bundle identifier; separate monitors such as CodexBar have their own polling schedules.
 
-A freshly built app may need a new macOS Keychain grant. Claude Code can also rotate or recreate its Keychain item. If silent access is no longer available, TokenBar retains the last measurement and shows **Authorize Claude access**, rather than requesting your password during automatic checks. Choosing that explicit action can still require your Mac login password. Enter that password only in macOS's own dialog; TokenBar does not collect it.
+For the direct OAuth compatibility path, a rebuilt app or rotated Claude Keychain item may need a new grant. The preferred CLI path avoids TokenBar reading that foreign item. A genuinely signed-out Claude Code still requires signing in; TokenBar cannot restore a revoked account session without authentication.
 
 ## Updating
 
@@ -116,8 +121,8 @@ open /Applications/TokenBar.app
 | --- | --- |
 | TokenBar is not visible | Run `open /Applications/TokenBar.app` |
 | Claude has no saved sign-in | Select **Connect Claude**; only this action starts browser sign-in |
-| Claude Keychain access is unavailable | Select **Authorize Claude access** to grant the installed app access; if macOS asks for your password, enter it yourself |
-| Claude session expired | Open Claude Code to renew the session, then click **Refresh**; Refresh itself does not launch any authentication helper |
+| Claude Keychain access is unavailable | Install CodexBar to enable automatic CLI checks; its menu-bar app can stay closed |
+| Claude session expired | With the CodexBar adapter installed, Claude Code renews its own credential during scheduled usage probes; if actually signed out, connect Claude once |
 | Claude returns HTTP 403 | Check account permissions on the Claude usage page; repeated sign-in is not assumed to fix it |
 | Claude is rate limited | Wait until the displayed next check; manual Refresh and restarts preserve the cooldown |
 | Multiple usage monitors are running | Keep one Claude monitor active to avoid polling the same endpoint from multiple apps |

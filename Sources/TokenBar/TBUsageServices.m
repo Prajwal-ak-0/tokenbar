@@ -79,7 +79,7 @@ static NSString *TBExecutable(NSString *name) {
     return nil;
 }
 
-static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *arguments) {
+static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *arguments, NSTimeInterval timeout) {
     NSTask *task = [NSTask new];
     NSPipe *output = [NSPipe pipe];
     NSPipe *error = [NSPipe pipe];
@@ -89,35 +89,46 @@ static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *argume
     task.standardInput = NSFileHandle.fileHandleWithNullDevice;
     task.standardOutput = output;
     task.standardError = error;
+    NSMutableDictionary *environment = [NSProcessInfo.processInfo.environment mutableCopy];
+    environment[@"CLAUDE_CODE_SAFE_MODE"] = @"1";
+    environment[@"DISABLE_AUTOUPDATER"] = @"1";
+    task.environment = environment;
     // Drain both pipes while the CLI runs; waiting first can deadlock on a full pipe.
     NSMutableData *stdoutData = [NSMutableData data];
     NSMutableData *stderrData = [NSMutableData data];
-    output.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
-        NSData *data = handle.availableData;
-        @synchronized (stdoutData) { if (stdoutData.length + data.length <= 65536) [stdoutData appendData:data]; }
-    };
-    error.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
-        NSData *data = handle.availableData;
-        @synchronized (stderrData) { if (stderrData.length + data.length <= 65536) [stderrData appendData:data]; }
-    };
     dispatch_semaphore_t exited = dispatch_semaphore_create(0);
     task.terminationHandler = ^(NSTask *finished) { dispatch_semaphore_signal(exited); };
     NSError *launchError = nil;
     if (![task launchAndReturnError:&launchError]) {
-        output.fileHandleForReading.readabilityHandler = nil;
-        error.fileHandleForReading.readabilityHandler = nil;
         return @{@"status": @(-1)};
     }
-    BOOL timedOut = dispatch_semaphore_wait(exited, dispatch_time(DISPATCH_TIME_NOW, 180 * NSEC_PER_SEC)) != 0;
+    dispatch_group_t drained = dispatch_group_create();
+    for (NSArray *pair in @[@[output.fileHandleForReading, stdoutData], @[error.fileHandleForReading, stderrData]]) {
+        dispatch_group_async(drained, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSFileHandle *handle = pair[0];
+            NSMutableData *buffer = pair[1];
+            while (YES) {
+                NSData *data = [handle readDataOfLength:4096];
+                if (data.length == 0) break;
+                @synchronized (buffer) {
+                    if (buffer.length + data.length <= 65536) [buffer appendData:data];
+                }
+            }
+        });
+    }
+    BOOL timedOut = dispatch_semaphore_wait(exited, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC))) != 0;
     if (timedOut && task.running) {
         [task terminate];
         if (dispatch_semaphore_wait(exited, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) != 0 && task.running) {
             kill(task.processIdentifier, SIGKILL);
+            dispatch_semaphore_wait(exited, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC));
         }
     }
-    output.fileHandleForReading.readabilityHandler = nil;
-    error.fileHandleForReading.readabilityHandler = nil;
-    return @{@"status": timedOut ? @(-1) : @(task.terminationStatus)};
+    // Await EOF before decoding; the termination handler can run before the final pipe read.
+    dispatch_group_wait(drained, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC));
+    @synchronized (stdoutData) {
+        return @{@"status": timedOut ? @(-1) : @(task.terminationStatus), @"data": [stdoutData copy]};
+    }
 }
 
 @implementation TBCodexUsageService
@@ -274,6 +285,64 @@ static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *argume
 
 - (NSDate *)now { return NSDate.date; }
 
+- (NSString *)usageCLIPath {
+    // Use the installed, maintained PTY adapter; Claude Code owns its credential access
+    // and renewal. Never select Auto/Web here, which can import a different browser account.
+    for (NSString *path in @[@"/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI",
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Applications/CodexBar.app/Contents/Helpers/CodexBarCLI"]]) {
+        if ([NSFileManager.defaultManager isExecutableFileAtPath:path]) return path;
+    }
+    return TBExecutable(@"codexbar");
+}
+
+- (NSDictionary *)requestUsageWithCLIAtPath:(NSString *)path {
+    return TBRunTask(path, @[@"usage", @"--provider", @"claude", @"--source", @"cli",
+                            @"--format", @"json", @"--no-color"], 60);
+}
+
++ (NSDictionary *)claudePayloadFromCLIData:(NSData *)data error:(NSError **)error {
+    id decoded = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if ([decoded isKindOfClass:NSArray.class] && [decoded count] == 1) {
+        id entry = decoded[0];
+        if ([entry isKindOfClass:NSDictionary.class] && [entry[@"provider"] isEqual:@"claude"] &&
+            ([entry[@"source"] isEqual:@"claude"] || [entry[@"source"] isEqual:@"cli"])) {
+            id usage = entry[@"usage"];
+            if ([usage isKindOfClass:NSDictionary.class]) {
+                NSMutableDictionary *payload = [NSMutableDictionary new];
+                for (NSString *key in @[@"primary", @"secondary"]) {
+                    id window = usage[key];
+                    if (![window isKindOfClass:NSDictionary.class]) continue;
+                    payload[[key isEqual:@"primary"] ? @"five_hour" : @"seven_day"] = @{
+                        @"utilization": window[@"usedPercent"] ?: NSNull.null,
+                        @"resets_at": window[@"resetsAt"] ?: NSNull.null};
+                }
+                NSMutableArray *limits = [NSMutableArray new];
+                id extras = usage[@"extraRateWindows"];
+                if ([extras isKindOfClass:NSArray.class]) for (id extra in extras) {
+                    if (![extra isKindOfClass:NSDictionary.class] || ![extra[@"window"] isKindOfClass:NSDictionary.class] ||
+                        ![extra[@"title"] isKindOfClass:NSString.class]) continue;
+                    NSDictionary *window = extra[@"window"];
+                    if (![window[@"windowMinutes"] isKindOfClass:NSNumber.class] ||
+                        [window[@"windowMinutes"] integerValue] != 10080) continue;
+                    [limits addObject:@{@"kind": @"weekly_scoped", @"percent": window[@"usedPercent"] ?: NSNull.null,
+                        @"resets_at": window[@"resetsAt"] ?: NSNull.null,
+                        @"scope": @{@"model": @{@"display_name": extra[@"title"]}}}];
+                }
+                payload[@"limits"] = limits;
+                NSString *plan = [TBUsageParser claudePlanFromCredential:@{@"subscriptionType": usage[@"loginMethod"] ?: @""}];
+                return @{@"payload": payload, @"plan": plan ?: @"", @"updatedAt": usage[@"updatedAt"] ?: NSNull.null};
+            }
+        }
+    }
+    // Do not copy raw CLI diagnostics into preferences: they can contain account identity.
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding].lowercaseString;
+    BOOL limited = [text containsString:@"rate limit"] || [text containsString:@"rate_limit"] || [text containsString:@"429"];
+    if (error) *error = [NSError errorWithDomain:TBUsageErrorDomain code:TBClaudeErrorUnavailable userInfo:@{
+        NSLocalizedDescriptionKey: limited ? @"Anthropic is rate limiting usage checks. Automatic retry is scheduled."
+            : @"Claude Code usage is temporarily unavailable. TokenBar will retry automatically.", @"rateLimited": @(limited)}];
+    return nil;
+}
+
 - (NSDate *)nextRequestAt {
     id date = [self.defaults objectForKey:TBClaudeNextRequestAtKey];
     return [date isKindOfClass:NSDate.class] ? date : nil;
@@ -380,6 +449,53 @@ static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *argume
     completion(cache, error);
 }
 
+- (void)saveSnapshot:(TBProviderSnapshot *)snapshot payload:(NSDictionary *)payload {
+    if (snapshot.plan) [self.defaults setObject:snapshot.plan forKey:TBClaudeCachedPlanKey];
+    else [self.defaults removeObjectForKey:TBClaudeCachedPlanKey];
+    [self.defaults setObject:[NSJSONSerialization dataWithJSONObject:payload options:0 error:nil] forKey:TBClaudeCachedPayloadKey];
+    [self.defaults setObject:snapshot.fetchedAt forKey:TBClaudeCachedAtKey];
+    for (NSString *key in @[TBClaudeRateLimitCountKey, TBClaudeIssueKey, TBClaudeIssueCodeKey]) [self.defaults removeObjectForKey:key];
+}
+
+- (void)fetchWithCLI:(NSString *)path cache:(TBProviderSnapshot *)cache completion:(TBUsageCompletion)completion {
+    NSDictionary *result = [self requestUsageWithCLIAtPath:path];
+    NSError *error = nil;
+    NSDictionary *decoded = [TBClaudeUsageService claudePayloadFromCLIData:result[@"data"] ?: NSData.data error:&error];
+    TBProviderSnapshot *snapshot = nil;
+    if (decoded && [result[@"status"] intValue] == 0) {
+        NSISO8601DateFormatter *formatter = [NSISO8601DateFormatter new];
+        id rawDate = decoded[@"updatedAt"];
+        NSDate *capturedAt = [rawDate isKindOfClass:NSString.class] ? [formatter dateFromString:rawDate] : nil;
+        if (!capturedAt) {
+            formatter.formatOptions |= NSISO8601DateFormatWithFractionalSeconds;
+            capturedAt = [rawDate isKindOfClass:NSString.class] ? [formatter dateFromString:rawDate] : nil;
+        }
+        NSTimeInterval age = capturedAt ? [[self now] timeIntervalSinceDate:capturedAt] : INFINITY;
+        if (age >= -60 && age <= 120) {
+            snapshot = [TBUsageParser claudeSnapshotFromResponse:decoded[@"payload"] error:&error];
+            if (snapshot) {
+                snapshot.fetchedAt = capturedAt;
+                snapshot.plan = [decoded[@"plan"] length] > 0 ? decoded[@"plan"] : nil;
+                [self saveSnapshot:snapshot payload:decoded[@"payload"]];
+            }
+        } else {
+            error = TBError(@"Claude Code returned an old measurement. TokenBar will retry automatically.");
+        }
+    }
+    if (!snapshot) {
+        error = error ?: TBError(@"Claude Code usage check did not finish. TokenBar will retry automatically.");
+        if ([error.userInfo[@"rateLimited"] boolValue]) {
+            NSInteger count = MIN([self.defaults integerForKey:TBClaudeRateLimitCountKey] + 1, 10);
+            NSTimeInterval delay = MIN(TBClaudeInitialRateLimitBackoff * pow(2, count - 1), TBClaudeMaximumRateLimitBackoff);
+            [self.defaults setInteger:count forKey:TBClaudeRateLimitCountKey];
+            [self.defaults setObject:[[self now] dateByAddingTimeInterval:delay] forKey:TBClaudeNextRequestAtKey];
+        }
+        [self.defaults setObject:error.localizedDescription forKey:TBClaudeIssueKey];
+        [self.defaults setInteger:error.code forKey:TBClaudeIssueCodeKey];
+    }
+    [self finishWithCache:snapshot ?: cache error:error completion:completion];
+}
+
 - (void)fetchWithUserInitiated:(BOOL)userInitiated completion:(TBUsageCompletion)completion {
     dispatch_async(self.queue, ^{
         NSUserDefaults *defaults = self.defaults;
@@ -394,13 +510,18 @@ static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *argume
         // Throttle every attempt, including offline, unreadable credentials and malformed responses.
         [defaults setObject:[now dateByAddingTimeInterval:TBClaudeMinimumRequestInterval]
                      forKey:TBClaudeNextRequestAtKey];
+        NSString *cli = [self usageCLIPath];
+        if (cli) {
+            [self fetchWithCLI:cli cache:cache completion:completion];
+            return;
+        }
         NSError *credentialError = nil;
         NSDictionary *oauth = [self readCredentialAllowingInteraction:NO error:&credentialError];
         NSNumber *expiresAt = oauth[@"expiresAt"];
         BOOL expired = [expiresAt respondsToSelector:@selector(doubleValue)] &&
             expiresAt.doubleValue / 1000.0 <= now.timeIntervalSince1970 + 60;
-        // Ordinary Refresh must not launch Claude Code: the CLI owns its own Keychain
-        // behavior and can raise password dialogs outside this process's no-UI controls.
+        // Compatibility path when CodexBar's CLI adapter is not installed. The preferred
+        // CLI source above keeps Claude's credential renewal with its trusted owner.
         if (!oauth || expired) {
             NSError *error = !oauth ? credentialError : TBClaudeError(TBClaudeErrorExpired,
                 @"Claude session expired. Open Claude Code to renew it, then click Refresh.");
@@ -435,14 +556,7 @@ static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *argume
                 if (snapshot) {
                     snapshot.fetchedAt = [self now];
                     snapshot.plan = [TBUsageParser claudePlanFromCredential:oauth];
-                    if (snapshot.plan) [defaults setObject:snapshot.plan forKey:TBClaudeCachedPlanKey];
-                    else [defaults removeObjectForKey:TBClaudeCachedPlanKey];
-                    [defaults setObject:[NSJSONSerialization dataWithJSONObject:payload options:0 error:nil]
-                                 forKey:TBClaudeCachedPayloadKey];
-                    [defaults setObject:snapshot.fetchedAt forKey:TBClaudeCachedAtKey];
-                    [defaults removeObjectForKey:TBClaudeRateLimitCountKey];
-                    [defaults removeObjectForKey:TBClaudeIssueKey];
-                    [defaults removeObjectForKey:TBClaudeIssueCodeKey];
+                    [self saveSnapshot:snapshot payload:payload];
                 }
             } else if (!error) {
                 error = TBError(@"Claude returned an unreadable response.");
@@ -472,7 +586,7 @@ static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *argume
         NSString *claude = TBExecutable(@"claude");
         if (!claude) { completion(TBError(@"Could not find Claude Code on this Mac.")); return; }
         // Only the explicit Connect action starts a browser sign-in.
-        NSDictionary *result = TBRunTask(claude, @[@"auth", @"login", @"--claudeai"]);
+        NSDictionary *result = TBRunTask(claude, @[@"auth", @"login", @"--claudeai"], 180);
         if ([result[@"status"] intValue] != 0) {
             completion(TBError(@"Claude sign-in did not finish. Try signing in from Claude Code."));
             return;
