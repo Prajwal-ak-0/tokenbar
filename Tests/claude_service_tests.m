@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import "TBUsageServices.h"
+#import <LocalAuthentication/LocalAuthentication.h>
 
 // No real preferences, Keychain calls, CLI processes, or network traffic in this suite.
 @interface TBMemoryDefaults : NSUserDefaults
@@ -21,9 +22,7 @@
 @property(nonatomic) NSError *credentialError;
 @property(nonatomic) NSDictionary *reply;
 @property(nonatomic) NSInteger requests;
-@property(nonatomic) NSInteger renewals;
 @property(nonatomic) NSInteger interactiveReads;
-@property(nonatomic) BOOL renewSucceeds;
 @end
 @implementation TBTestClaudeService
 - (instancetype)initWithDefaults:(NSUserDefaults *)defaults {
@@ -38,10 +37,6 @@
     if (allow) self.interactiveReads++;
     if (error) *error = self.credentialError;
     return self.credential;
-}
-- (void)renewClaudeSession {
-    self.renewals++;
-    if (self.renewSucceeds) self.credential = @{@"accessToken": @"synthetic-new-token", @"expiresAt": @1800100000000};
 }
 - (NSDictionary *)requestUsageWithToken:(NSString *)token { self.requests++; return self.reply; }
 @end
@@ -169,19 +164,19 @@ static void TestCredentialFailureClassification(void) {
     NSCAssert(error.code == TBClaudeErrorSignInRequired, @"A missing login must remain distinct");
 }
 
-static void TestExpiredCredentialRenewal(void) {
+static void TestExpiredCredentialsStaySilent(void) {
     TBTestClaudeService *service = Service(NULL);
     service.credential = @{@"accessToken": @"synthetic-expired-token", @"expiresAt": @1700000000000};
     NSError *error;
     Fetch(service, NO, &error);
-    NSCAssert(error.code == TBClaudeErrorExpired && !service.requests && !service.renewals, @"Background work must neither send expired tokens nor launch the owner CLI");
-    service.renewSucceeds = YES;
-    NSCAssert(Fetch(service, YES, &error) && !error, @"Manual refresh may renew through the owner CLI");
-    NSCAssert(service.renewals == 1 && service.requests == 1, @"Renew before requesting usage");
-    service = Service(NULL);
-    service.credential = @{@"accessToken": @"synthetic-expired-token", @"expiresAt": @1700000000000};
+    NSCAssert(error.code == TBClaudeErrorExpired && !service.requests && !service.interactiveReads,
+              @"Background work must neither send expired tokens nor prompt");
     Fetch(service, YES, &error);
-    NSCAssert(error.code == TBClaudeErrorExpired && !service.requests, @"Failed renewal must not send the expired token");
+    NSCAssert(error.code == TBClaudeErrorExpired && !service.requests && !service.interactiveReads,
+              @"Ordinary manual Refresh must also remain noninteractive");
+    service.credential = @{@"accessToken": @"synthetic-renewed-token", @"expiresAt": @1800100000000};
+    NSCAssert(Fetch(service, YES, &error) && !error && service.requests == 1,
+              @"A credential renewed externally by Claude Code should recover without a new login");
 }
 
 static void TestUnauthorizedAndForbidden(void) {
@@ -191,10 +186,87 @@ static void TestUnauthorizedAndForbidden(void) {
         NSError *error;
         Fetch(service, NO, &error);
         NSCAssert(error && error.code != TBClaudeErrorSignInRequired, @"API rejection does not prove the local login is absent");
-        NSCAssert(!service.renewals && !service.interactiveReads, @"Rejection must not trigger a background auth flow");
+        NSCAssert(!service.interactiveReads, @"Rejection must not trigger a background auth flow");
         Fetch(service, YES, &error);
         NSCAssert(error && service.requests == 1, @"Auth rejection must retain its error during cooldown");
     }
+}
+
+// Exercise the real credential reader, replacing only the OS calls. The older tests
+// mocked the whole reader and could not detect a missing legacy no-dialog policy.
+@interface TBKeychainProbeService : TBClaudeUsageService
+@property(nonatomic) NSMutableArray *events;
+@property(nonatomic) NSDictionary *lastQuery;
+@property(nonatomic) OSStatus copyStatus;
+@property(nonatomic) OSStatus disableStatus;
+@property(nonatomic) BOOL throwOnCopy;
+@property(nonatomic) NSData *syntheticData;
+@end
+
+@implementation TBKeychainProbeService
+- (instancetype)init {
+    if ((self = [super initWithDefaults:[TBMemoryDefaults new]])) {
+        _events = [NSMutableArray new];
+        _copyStatus = errSecInteractionNotAllowed;
+    }
+    return self;
+}
+- (OSStatus)setKeychainInteractionAllowed:(BOOL)allowed {
+    [self.events addObject:allowed ? @"allow" : @"deny"];
+    return allowed ? errSecSuccess : self.disableStatus;
+}
+- (OSStatus)copyKeychainItemMatching:(NSDictionary *)query result:(CFTypeRef *)result {
+    self.lastQuery = query;
+    [self.events addObject:@"copy"];
+    if (self.throwOnCopy) [NSException raise:@"SyntheticKeychainFailure" format:@"Test failure"];
+    if (result && self.syntheticData) *result = CFBridgingRetain(self.syntheticData);
+    return self.copyStatus;
+}
+@end
+
+static void TestKeychainNoDialogBoundary(void) {
+    TBKeychainProbeService *service = [TBKeychainProbeService new];
+    NSError *error = nil;
+    NSCAssert(![service readCredentialAllowingInteraction:NO error:&error], @"Locked credentials should be unavailable");
+    NSCAssert(error.code == TBClaudeErrorKeychainAccess, @"Unavailable access should retain the manual recovery action");
+    NSCAssert(([service.events isEqual:@[@"deny", @"copy", @"deny"]]), @"Disable process-wide dialogs before reading and keep them disabled afterward");
+    LAContext *context = service.lastQuery[(__bridge id)kSecUseAuthenticationContext];
+    NSCAssert(context.interactionNotAllowed, @"Background reader must also forbid LAContext interaction");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    NSCAssert([service.lastQuery[(__bridge id)kSecUseAuthenticationUI] isEqual:(__bridge id)kSecUseAuthenticationUIFail],
+              @"Legacy Keychain requires explicit UI-fail policy in addition to LAContext");
+#pragma clang diagnostic pop
+
+    [service.events removeAllObjects];
+    service.disableStatus = errSecNotAvailable;
+    [service readCredentialAllowingInteraction:NO error:&error];
+    NSCAssert(([service.events isEqual:@[@"deny", @"deny"]]), @"Fail closed without reading credentials if dialog suppression fails");
+
+    [service.events removeAllObjects];
+    service.disableStatus = errSecSuccess;
+    service.throwOnCopy = YES;
+    @try { [service readCredentialAllowingInteraction:YES error:&error]; }
+    @catch (NSException *exception) { NSCAssert([exception.name isEqual:@"SyntheticKeychainFailure"], @"Expected injected failure"); }
+    NSCAssert(([service.events isEqual:@[@"allow", @"copy", @"deny"]]), @"Even an exceptional interactive read must restore no-dialog mode");
+}
+
+static void TestExplicitAuthorizationBoundary(void) {
+    TBKeychainProbeService *service = [TBKeychainProbeService new];
+    service.copyStatus = errSecSuccess;
+    service.syntheticData = [NSJSONSerialization dataWithJSONObject:
+        @{@"claudeAiOauth": @{@"accessToken": @"synthetic-authorized-token"}} options:0 error:nil];
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    [service authorizeWithCompletion:^(NSError *error) {
+        NSCAssert(!error, @"Explicit authorization should read the synthetic credential");
+        dispatch_semaphore_signal(done);
+    }];
+    NSCAssert(dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC)) == 0, @"Authorization must complete");
+    NSCAssert(([service.events isEqual:@[@"allow", @"copy", @"deny"]]), @"Only explicit authorization may temporarily enable dialogs");
+    LAContext *context = service.lastQuery[(__bridge id)kSecUseAuthenticationContext];
+    NSCAssert(!context.interactionNotAllowed, @"Explicit authorization may permit the user-owned Keychain prompt");
+    NSCAssert(![[(TBMemoryDefaults *)[service valueForKey:@"defaults"] values].description containsString:@"synthetic-authorized-token"],
+              @"Authorization must not persist provider tokens");
 }
 
 int main(void) {
@@ -204,8 +276,10 @@ int main(void) {
         TestRetryAfterDateAndExponentialBackoff();
         TestNetworkAndMalformedResponses();
         TestCredentialFailureClassification();
-        TestExpiredCredentialRenewal();
+        TestExpiredCredentialsStaySilent();
         TestUnauthorizedAndForbidden();
+        TestKeychainNoDialogBoundary();
+        TestExplicitAuthorizationBoundary();
         NSLog(@"TokenBar Claude service tests passed");
     }
     return 0;

@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <Security/Security.h>
 #import "TBUsageModels.h"
 
 NS_ASSUME_NONNULL_BEGIN
@@ -19,6 +20,7 @@ typedef NS_ENUM(NSInteger, TBClaudeErrorCode) {
 };
 
 @interface TBClaudeUsageService : NSObject
++ (void)disableAutomaticKeychainInteraction;
 @property(nonatomic, readonly, nullable) NSDate *nextRequestAt;
 - (void)fetchWithCompletion:(TBUsageCompletion)completion;
 - (void)fetchWithUserInitiated:(BOOL)userInitiated completion:(TBUsageCompletion)completion;
@@ -28,7 +30,8 @@ typedef NS_ENUM(NSInteger, TBClaudeErrorCode) {
 - (instancetype)initWithDefaults:(NSUserDefaults *)defaults;
 - (NSDate *)now;
 - (nullable NSDictionary *)readCredentialAllowingInteraction:(BOOL)allowInteraction error:(NSError **)error;
-- (void)renewClaudeSession;
+- (OSStatus)copyKeychainItemMatching:(NSDictionary *)query result:(CFTypeRef _Nullable *_Nullable)result;
+- (OSStatus)setKeychainInteractionAllowed:(BOOL)allowed;
 - (NSDictionary *)requestUsageWithToken:(NSString *)token;
 - (void)connectWithCompletion:(TBActionCompletion)completion;
 @end

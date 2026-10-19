@@ -86,7 +86,7 @@ TokenBar queries the local Codex app server through `account/rateLimits/read` an
 
 ### Claude
 
-TokenBar reads the existing Claude Code OAuth credential from macOS Keychain and requests usage from Anthropic's authenticated Claude usage endpoint. Background reads prohibit Keychain interaction; **Authorize Claude access** is a separate manual action if permission is unavailable. Token expiry and HTTP 401/403 are distinguished from missing credentials, so an access problem does not automatically request a new browser login. For an expired token, manual **Refresh** lets Claude Code attempt renewal through its local `/status` command; background refresh never launches that CLI, and TokenBar never exchanges Claude Code's rotating refresh token. The CLI owns its own credential behavior and may request permission during that manual recovery. This endpoint is not a documented public API and may change; TokenBar uses conservative polling, persistent caching, and rate-limit backoff to avoid unnecessary traffic.
+TokenBar reads the existing Claude Code OAuth credential from macOS Keychain and requests usage from Anthropic's authenticated Claude usage endpoint. Background and ordinary Refresh reads prohibit Keychain interaction with the process-wide legacy interaction switch, an explicit UI-fail query policy, and a noninteractive authentication context. **Authorize Claude access** is a separate manual action if permission is unavailable; only that action temporarily enables TokenBar's Keychain permission dialog. Token expiry and HTTP 401/403 are distinguished from missing credentials, so an access problem does not automatically request a new browser login. For an expired token, open Claude Code to renew its own credential, then click **Refresh**. TokenBar never launches Claude Code from background checks or ordinary Refresh, and never exchanges Claude Code's rotating refresh token. This avoids provider-owned Keychain prompts escaping TokenBar's no-dialog controls. This endpoint is not a documented public API and may change; TokenBar uses conservative polling, persistent caching, and rate-limit backoff to avoid unnecessary traffic.
 
 ### Refresh and recovery
 
@@ -96,7 +96,7 @@ Automatic checks adapt to interaction: every 5 minutes for an hour after opening
 
 Model-specific limits are available behind a disclosure below Claude's primary rows; the disclosure turns amber when an additional limit reaches 75%. Settings, including **Launch at Login** and **Quit TokenBar**, live in the gear menu. TokenBar allows one running instance per app bundle identifier; separate monitors such as CodexBar have their own polling schedules.
 
-A freshly built app may need a new macOS Keychain grant. Claude Code can also rotate or recreate its Keychain item. TokenBar keeps this permission problem separate from account authentication, but cannot guarantee that macOS will never ask again.
+A freshly built app may need a new macOS Keychain grant. Claude Code can also rotate or recreate its Keychain item. If silent access is no longer available, TokenBar retains the last measurement and shows **Authorize Claude access**, rather than requesting your password during automatic checks. Choosing that explicit action can still require your Mac login password. Enter that password only in macOS's own dialog; TokenBar does not collect it.
 
 ## Updating
 
@@ -117,7 +117,7 @@ open /Applications/TokenBar.app
 | TokenBar is not visible | Run `open /Applications/TokenBar.app` |
 | Claude has no saved sign-in | Select **Connect Claude**; only this action starts browser sign-in |
 | Claude Keychain access is unavailable | Select **Authorize Claude access** to grant the installed app access; if macOS asks for your password, enter it yourself |
-| Claude session expired | Open Claude Code to renew the session, then click **Refresh**; manual Refresh also tries Claude Code's local renewal path |
+| Claude session expired | Open Claude Code to renew the session, then click **Refresh**; Refresh itself does not launch any authentication helper |
 | Claude returns HTTP 403 | Check account permissions on the Claude usage page; repeated sign-in is not assumed to fix it |
 | Claude is rate limited | Wait until the displayed next check; manual Refresh and restarts preserve the cooldown |
 | Multiple usage monitors are running | Keep one Claude monitor active to avoid polling the same endpoint from multiple apps |

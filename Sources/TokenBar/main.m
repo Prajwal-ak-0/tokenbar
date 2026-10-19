@@ -677,6 +677,7 @@ static NSButton *TBSymbolButton(NSString *symbol, NSString *label, id target, SE
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        [TBClaudeUsageService disableAutomaticKeychainInteraction];
         NSApplication *application = NSApplication.sharedApplication;
         for (NSRunningApplication *other in [NSRunningApplication runningApplicationsWithBundleIdentifier:NSBundle.mainBundle.bundleIdentifier]) {
             if (other.processIdentifier != NSProcessInfo.processInfo.processIdentifier) return 0;
