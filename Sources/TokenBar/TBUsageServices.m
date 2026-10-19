@@ -1,7 +1,6 @@
 #import "TBUsageServices.h"
 #import <Security/Security.h>
 #import <LocalAuthentication/LocalAuthentication.h>
-#import <util.h>
 #import <signal.h>
 #import <unistd.h>
 
@@ -241,6 +240,26 @@ static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *argume
 
 @implementation TBClaudeUsageService
 
++ (void)disableAutomaticKeychainInteraction {
+    // Legacy generic-password ACL dialogs are not reliably governed by LAContext alone.
+    // Keep this deprecated macOS control until Security offers an equivalent for legacy items.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    SecKeychainSetUserInteractionAllowed(false);
+#pragma clang diagnostic pop
+}
+
+- (OSStatus)setKeychainInteractionAllowed:(BOOL)allowed {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return SecKeychainSetUserInteractionAllowed(allowed);
+#pragma clang diagnostic pop
+}
+
+- (OSStatus)copyKeychainItemMatching:(NSDictionary *)query result:(CFTypeRef *)result {
+    return SecItemCopyMatching((__bridge CFDictionaryRef)query, result);
+}
+
 - (instancetype)init {
     return [self initWithDefaults:NSUserDefaults.standardUserDefaults];
 }
@@ -261,7 +280,6 @@ static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *argume
 }
 
 - (NSDictionary *)readCredentialAllowingInteraction:(BOOL)allowInteraction error:(NSError **)error {
-    // Unlike `security -w`, Security.framework can guarantee that background reads never show UI.
     LAContext *context = [LAContext new];
     context.interactionNotAllowed = !allowInteraction;
     NSDictionary *query = @{
@@ -270,15 +288,34 @@ static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *argume
         (__bridge id)kSecReturnData: @YES,
         (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne,
         (__bridge id)kSecUseAuthenticationContext: context,
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        // Required in addition to LAContext for macOS legacy Keychain ACL prompts.
+        (__bridge id)kSecUseAuthenticationUI: allowInteraction
+            ? (__bridge id)kSecUseAuthenticationUIAllow : (__bridge id)kSecUseAuthenticationUIFail,
+#pragma clang diagnostic pop
     };
+    static NSLock *interactionLock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ interactionLock = [NSLock new]; });
     CFTypeRef result = NULL;
-    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+    OSStatus status;
+    // Serialize the process-wide switch across all service instances. Only the explicit
+    // Authorize action may enable dialogs, and always restore the no-dialog default.
+    [interactionLock lock];
+    @try {
+        status = [self setKeychainInteractionAllowed:allowInteraction];
+        if (status == errSecSuccess) status = [self copyKeychainItemMatching:query result:&result];
+    } @finally {
+        [self setKeychainInteractionAllowed:NO];
+        [interactionLock unlock];
+    }
     NSData *data = CFBridgingRelease(result);
     if (status != errSecSuccess) {
         if (error) *error = status == errSecItemNotFound
             ? TBClaudeError(TBClaudeErrorSignInRequired, @"Claude Code has no saved sign-in. Connect Claude to continue.")
             : TBClaudeError(TBClaudeErrorKeychainAccess,
-                @"Claude Keychain access is unavailable. Authorize access; signing in again may be unnecessary.");
+                @"Claude Keychain access is unavailable. Authorize access when ready; automatic checks will stay silent.");
         return nil;
     }
     id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
@@ -295,46 +332,6 @@ static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *argume
     }
     if (error) *error = TBClaudeError(TBClaudeErrorSignInRequired, @"Claude Code has no saved subscription credential.");
     return nil;
-}
-
-- (void)renewClaudeSession {
-    // Claude owns its rotating refresh token. A manual Refresh may touch its local /status command;
-    // TokenBar never submits or persists that refresh token and never runs this from a timer.
-    NSString *claude = TBExecutable(@"claude");
-    if (!claude) return;
-    int primary = -1, secondary = -1;
-    struct winsize size = {.ws_row = 40, .ws_col = 120};
-    if (openpty(&primary, &secondary, NULL, NULL, &size) != 0) return;
-    NSFileHandle *reader = [[NSFileHandle alloc] initWithFileDescriptor:primary closeOnDealloc:YES];
-    NSFileHandle *terminal = [[NSFileHandle alloc] initWithFileDescriptor:secondary closeOnDealloc:YES];
-    NSTask *task = [NSTask new];
-    task.executableURL = [NSURL fileURLWithPath:claude];
-    task.arguments = @[@"--setting-sources", @"", @"--strict-mcp-config", @"--mcp-config", @"{\"mcpServers\":{}}", @"/status"];
-    task.currentDirectoryURL = [NSURL fileURLWithPath:NSHomeDirectory()];
-    NSMutableDictionary *environment = [NSProcessInfo.processInfo.environment mutableCopy];
-    environment[@"CLAUDE_CODE_SAFE_MODE"] = @"1";
-    environment[@"TERM"] = @"xterm-256color";
-    task.environment = environment;
-    task.standardInput = terminal;
-    task.standardOutput = terminal;
-    task.standardError = terminal;
-    // Drain without retaining terminal text, which may contain account details.
-    reader.readabilityHandler = ^(NSFileHandle *handle) {
-        char buffer[8192];
-        (void)read(handle.fileDescriptor, buffer, sizeof(buffer));
-    };
-    dispatch_semaphore_t exited = dispatch_semaphore_create(0);
-    task.terminationHandler = ^(NSTask *finished) { dispatch_semaphore_signal(exited); };
-    if ([task launchAndReturnError:nil]) {
-        dispatch_semaphore_wait(exited, dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC));
-        if (task.running) [task terminate];
-        if (dispatch_semaphore_wait(exited, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) != 0 && task.running) {
-            kill(task.processIdentifier, SIGKILL);
-        }
-    }
-    reader.readabilityHandler = nil;
-    [reader closeFile];
-    [terminal closeFile];
 }
 
 - (NSDictionary *)requestUsageWithToken:(NSString *)token {
@@ -402,13 +399,8 @@ static NSDictionary *TBRunTask(NSString *executable, NSArray<NSString *> *argume
         NSNumber *expiresAt = oauth[@"expiresAt"];
         BOOL expired = [expiresAt respondsToSelector:@selector(doubleValue)] &&
             expiresAt.doubleValue / 1000.0 <= now.timeIntervalSince1970 + 60;
-        if (oauth && expired && userInitiated) {
-            [self renewClaudeSession];
-            oauth = [self readCredentialAllowingInteraction:NO error:&credentialError];
-            expiresAt = oauth[@"expiresAt"];
-            expired = [expiresAt respondsToSelector:@selector(doubleValue)] &&
-                expiresAt.doubleValue / 1000.0 <= [self now].timeIntervalSince1970 + 60;
-        }
+        // Ordinary Refresh must not launch Claude Code: the CLI owns its own Keychain
+        // behavior and can raise password dialogs outside this process's no-UI controls.
         if (!oauth || expired) {
             NSError *error = !oauth ? credentialError : TBClaudeError(TBClaudeErrorExpired,
                 @"Claude session expired. Open Claude Code to renew it, then click Refresh.");
